@@ -1,4 +1,3 @@
-pub mod client;
 pub mod envelopes;
 pub mod file_chunk;
 pub mod protocol_version;
@@ -57,9 +56,10 @@ pub struct UserAgentHeader {
 
 /// Declares the wire-protocol version a client speaks — independent of
 /// `UserAgentHeader`, which is just product/implementation identification.
-/// Both `orosu-server` and `orosu-client` share `protocol_version::PROTOCOL_VERSION`
-/// from this same crate, so they can't drift from each other; the JS action
-/// (client/src/protocolVersion.js) keeps its own hardcoded copy in sync by hand.
+/// `orosu-server` reads `protocol_version::PROTOCOL_VERSION` from this same
+/// crate; the JS action (client/src/protocolVersion.js), the only client
+/// left now that the Rust CLI client has been dropped, keeps its own
+/// hardcoded copy in sync by hand since it can't share a Rust constant.
 pub struct ProtocolVersionHeader {
     pub version: u32,
 }

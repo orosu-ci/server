@@ -89,20 +89,6 @@ jobs:
           echo "deb_path=${DEB_PATH}" >> $GITHUB_OUTPUT
           echo "Built package: ${DEB_PATH}"
 
-      - name: Build DEB client package
-        id: build_deb_client
-        run: |
-          DEB_PATH=$(cargo deb --no-build --target ${{ matrix.target }} -p orosu-client)
-          echo "deb_path=${DEB_PATH}" >> $GITHUB_OUTPUT
-          echo "Built package: ${DEB_PATH}"
-
-      - name: Upload client binaries artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: orosu-client-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/orosu-client
-          retention-days: 90
-
       - name: Upload keygen binaries artifact
         uses: actions/upload-artifact@v4
         with:
@@ -117,25 +103,15 @@ jobs:
           path: ${{ steps.build_deb_server.outputs.deb_path }}
           retention-days: 90
 
-      - name: Upload DEB client artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: deb-client-${{ matrix.arch }}
-          path: ${{ steps.build_deb_client.outputs.deb_path }}
-          retention-days: 90
-
       - name: Rename binaries for release
         run: |
-          mv target/${{ matrix.target }}/release/orosu-client target/${{ matrix.target }}/release/orosu-client-${{ matrix.arch }}
           mv target/${{ matrix.target }}/release/orosu-keygen target/${{ matrix.target }}/release/orosu-keygen-${{ matrix.arch }}
 
       - name: Attach outputs to release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            target/${{ matrix.target }}/release/orosu-client-${{ matrix.arch }}
             target/${{ matrix.target }}/release/orosu-keygen-${{ matrix.arch }}
-            ${{ steps.build_deb_client.outputs.deb_path }}
             ${{ steps.build_deb_server.outputs.deb_path }}
 
   deploy-packages:
@@ -151,12 +127,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: deb-server-${{ matrix.arch }}
-          path: ./packages
-
-      - name: Download DEB client artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: deb-client-${{ matrix.arch }}
           path: ./packages
 
       - name: Upload and publish DEB packages

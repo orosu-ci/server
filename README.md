@@ -137,7 +137,7 @@ Next you need to go to your CI pipeline and add a step to trigger the job.
     address: ${{ secrets.OROSU_SERVER_URL }}
     script: test-script
     key: ${{ secrets.OROSU_CLIENT_KEY }}
-    args: "from CI pipeline"
+    arguments: "from CI pipeline"
 ```
 
 As soon as you will trigger the job, the server will execute the script and print `Hello, from CI pipeline!` to the log.

@@ -1,15 +1,14 @@
 //! End-to-end tests against a real `Server` bound to a real TCP port,
-//! exercised with real WebSocket clients (mirroring how orosu-client and the
-//! JS action both actually talk to it). This is the highest-risk code in
-//! the crate — auth, the WS task-launch/file-upload handshake, IP
-//! filtering — so it's deliberately tested at this level rather than only
-//! unit-tested in isolation.
+//! exercised with real WebSocket clients (mirroring how the JS action
+//! actually talks to it — the Rust CLI client this crate used to ship has
+//! been discontinued in its favor). This is the highest-risk code in the
+//! crate — auth, the WS task-launch/file-upload handshake, IP filtering —
+//! so it's deliberately tested at this level rather than only unit-tested
+//! in isolation.
 //!
-//! Deliberately NOT using `ApiClient` (api/client.rs) here: its
-//! `start_task` calls `std::process::exit()` directly on receiving the
-//! task's exit code — correct for the real CLI, but it would kill this
-//! whole test binary, not just fail one test. Every test below drives the
-//! wire protocol manually instead.
+//! There's no in-crate client library to drive this handshake with — every
+//! test below constructs the wire protocol manually instead, mirroring what
+//! client/src/*.js does.
 //!
 //! `Server::serve()` doesn't expose the OS-assigned port when binding to
 //! `:0`, so each test picks its own fixed, distinct port.
@@ -72,11 +71,11 @@ fn write_public_key(dir: &std::path::Path, keygen: &Keygen) -> std::path::PathBu
     path
 }
 
-/// Mirrors `ApiClient::connect`'s own JWT construction (api/client.rs),
-/// parameterized so error-path tests can hand it a wrong client name or an
-/// already-expired `exp` — things the real `ApiClient` never produces.
-/// `Claims` (cryptography.rs) has crate-private fields, so this defines an
-/// equivalent local shape rather than needing access to it.
+/// Mirrors the real clients' JWT construction (see client/src/auth.js's JS
+/// implementation), parameterized so error-path tests can hand it a wrong
+/// client name or an already-expired `exp` — things a real client never
+/// produces. `Claims` (cryptography.rs) has crate-private fields, so this
+/// defines an equivalent local shape rather than needing access to it.
 #[derive(serde::Serialize)]
 struct TestClaims {
     sub: String,
@@ -102,8 +101,8 @@ fn sign_jwt(client_name: &str, seed: &[u8], exp_offset_secs: i64) -> String {
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Connects with fully custom headers (rather than through `ApiClient`), so
-/// handshake-rejection paths can be exercised directly. Always sends a
+/// Connects with fully custom headers, so handshake-rejection paths can be
+/// exercised directly. Always sends a
 /// correct protocol version, so tests using this aren't accidentally
 /// short-circuited by that check instead of the one they mean to exercise —
 /// see `connect_raw_with_protocol_version` for the tests that specifically

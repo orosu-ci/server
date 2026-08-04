@@ -1,11 +1,11 @@
 use crate::api::ProtocolVersionHeader;
 use axum::http::HeaderValue;
 
-/// The wire-protocol version this crate's client sends. Bump this whenever
-/// the envelope/handshake contract changes in a way that breaks
-/// compatibility with a server built against the previous value — and add
-/// the new value to `SUPPORTED_PROTOCOL_VERSIONS` below so the server can
-/// keep accepting the version it's replacing.
+/// The current wire-protocol version. Bump this whenever the
+/// envelope/handshake contract changes in a way that breaks compatibility
+/// with a client built against the previous value — and add the new value
+/// to `SUPPORTED_PROTOCOL_VERSIONS` below so the server can keep accepting
+/// the version it's replacing.
 ///
 /// Version 0 is implicit, not a value anything ever sends on purpose: every
 /// client built before this header existed sends no
@@ -14,14 +14,14 @@ use axum::http::HeaderValue;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Every protocol version this server will currently accept a client
-/// speaking — not just the one this crate's own client sends
-/// (`PROTOCOL_VERSION`). Version 0 has to stay listed until every
-/// currently-deployed client (including, as of introducing this header,
-/// every already-published `orosu-client` binary and JS action — none of
-/// which send this header at all) has actually been upgraded; dropping it
-/// here would reject that live traffic outright rather than let it
-/// interoperate during the rollout. See server/auth_scope.rs for the check
-/// that uses this.
+/// speaking — not just the current `PROTOCOL_VERSION`. Version 0 has to
+/// stay listed until every currently-deployed client (including, as of
+/// introducing this header, every already-published `orosu-client` binary —
+/// a Rust CLI since discontinued in favor of the JS action — and every JS
+/// action release that predates this header) has actually been upgraded;
+/// dropping it here would reject that live traffic outright rather than let
+/// it interoperate during the rollout. See server/auth_scope.rs for the
+/// check that uses this.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[0, PROTOCOL_VERSION];
 
 /// Shared by both the sending (api/client.rs) and receiving
