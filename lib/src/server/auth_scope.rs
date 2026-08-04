@@ -1,8 +1,10 @@
-use crate::api::UserAgentHeader;
+use crate::api::protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER_NAME};
+use crate::api::{ProtocolVersionHeader, UserAgentHeader};
 use crate::cryptography::Claims;
 use crate::server::{AuthContext, AuthScope, ServerState, WorkerAuthContext};
 use axum::Extension;
 use axum::extract::FromRequestParts;
+use axum::http::HeaderName;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -45,6 +47,36 @@ impl FromRequestParts<Arc<ServerState>> for AuthContext {
                 return Err(StatusCode::UNAUTHORIZED);
             }
         };
+
+        // Checked separately from auth on purpose: a version mismatch and a
+        // bad credential are different problems needing different fixes
+        // (upgrade software vs. rotate a key), so this gets its own status
+        // code (400) rather than folding into the 401s below.
+        let Some(protocol_version_header) = parts
+            .headers
+            .get(HeaderName::from_static(PROTOCOL_VERSION_HEADER_NAME))
+        else {
+            tracing::error!("Protocol version header is missing");
+            return Err(StatusCode::BAD_REQUEST);
+        };
+
+        let protocol_version_header: ProtocolVersionHeader =
+            match protocol_version_header.try_into() {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::error!("Unexpected protocol version header format: {e}");
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            };
+
+        if protocol_version_header.version != PROTOCOL_VERSION {
+            tracing::error!(
+                "Client protocol version {} does not match server protocol version {}",
+                protocol_version_header.version,
+                PROTOCOL_VERSION
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         match scope {
             AuthScope::Worker => {

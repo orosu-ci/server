@@ -23,6 +23,7 @@ use orosu::api::envelopes::{
     TaskLaunchStatusResponseEnvelope,
 };
 use orosu::api::file_chunk::FileChunk;
+use orosu::api::protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER_NAME};
 use orosu::api::{FileAttachment, ServerTaskNotification, StartTaskRequest, TaskLaunchStatus};
 use orosu::configuration::Configuration;
 use orosu::cryptography::{ClientKey, Keygen};
@@ -31,7 +32,7 @@ use std::io::Write;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
 fn build_config(yaml: &str) -> Configuration {
     serde_saphyr::from_str(yaml).unwrap()
@@ -100,11 +101,30 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Connects with fully custom headers (rather than through `ApiClient`), so
-/// handshake-rejection paths can be exercised directly.
+/// handshake-rejection paths can be exercised directly. Always sends a
+/// correct protocol version, so tests using this aren't accidentally
+/// short-circuited by that check instead of the one they mean to exercise —
+/// see `connect_raw_with_protocol_version` for the tests that specifically
+/// need to control it.
 async fn connect_raw(
     port: u16,
     authorization: Option<&str>,
     user_agent: Option<&str>,
+) -> Result<WsStream, tokio_tungstenite::tungstenite::Error> {
+    connect_raw_with_protocol_version(
+        port,
+        authorization,
+        user_agent,
+        Some(&PROTOCOL_VERSION.to_string()),
+    )
+    .await
+}
+
+async fn connect_raw_with_protocol_version(
+    port: u16,
+    authorization: Option<&str>,
+    user_agent: Option<&str>,
+    protocol_version: Option<&str>,
 ) -> Result<WsStream, tokio_tungstenite::tungstenite::Error> {
     let mut request = format!("ws://127.0.0.1:{port}/")
         .into_client_request()
@@ -116,6 +136,12 @@ async fn connect_raw(
     }
     if let Some(ua) = user_agent {
         headers.insert("user-agent", HeaderValue::from_str(ua).unwrap());
+    }
+    if let Some(pv) = protocol_version {
+        headers.insert(
+            HeaderName::from_static(PROTOCOL_VERSION_HEADER_NAME),
+            HeaderValue::from_str(pv).unwrap(),
+        );
     }
     let (stream, _response) = tokio_tungstenite::connect_async(request).await?;
     Ok(stream)
@@ -364,6 +390,53 @@ async fn rejects_a_user_agent_with_the_wrong_product_name() {
 
     let err = result.unwrap_err();
     assert_eq!(rejection_status(&err), Some(401));
+}
+
+#[tokio::test]
+async fn rejects_a_missing_protocol_version_header() {
+    let port = 19117;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(single_client_config(port, &public_key_path, ""), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let token = sign_jwt("test-client", &client_key.key, 10);
+    let result = connect_raw_with_protocol_version(
+        port,
+        Some(&format!("Token {token}")),
+        Some("Orosu/x"),
+        None,
+    )
+    .await;
+
+    // Distinct from the 401s used for actual auth failures above — a
+    // version mismatch and a bad credential need different fixes.
+    let err = result.unwrap_err();
+    assert_eq!(rejection_status(&err), Some(400));
+}
+
+#[tokio::test]
+async fn rejects_a_protocol_version_that_does_not_match_the_servers() {
+    let port = 19118;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(single_client_config(port, &public_key_path, ""), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let token = sign_jwt("test-client", &client_key.key, 10);
+    let wrong_version = (PROTOCOL_VERSION + 1).to_string();
+    let result = connect_raw_with_protocol_version(
+        port,
+        Some(&format!("Token {token}")),
+        Some("Orosu/x"),
+        Some(&wrong_version),
+    )
+    .await;
+
+    let err = result.unwrap_err();
+    assert_eq!(rejection_status(&err), Some(400));
 }
 
 #[tokio::test]

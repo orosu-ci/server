@@ -1,6 +1,7 @@
 pub mod client;
 pub mod envelopes;
 pub mod file_chunk;
+pub mod protocol_version;
 mod user_agent_header;
 
 use chrono::{DateTime, Utc};
@@ -52,6 +53,15 @@ pub enum ServerTaskNotification<O, E> {
 
 pub struct UserAgentHeader {
     pub version: String,
+}
+
+/// Declares the wire-protocol version a client speaks — independent of
+/// `UserAgentHeader`, which is just product/implementation identification.
+/// Both `orosu-server` and `orosu-client` share `protocol_version::PROTOCOL_VERSION`
+/// from this same crate, so they can't drift from each other; the JS action
+/// (client/src/protocolVersion.js) keeps its own hardcoded copy in sync by hand.
+pub struct ProtocolVersionHeader {
+    pub version: u32,
 }
 
 // These lock in the exact wire-format contract a JS reimplementation of the
