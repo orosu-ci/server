@@ -181,4 +181,81 @@ clients:
             ])
         );
     }
+
+    #[test]
+    fn log_level_defaults_to_info() {
+        assert_eq!(
+            LogLevelConfiguration::default(),
+            LogLevelConfiguration::Info
+        );
+    }
+
+    #[test]
+    fn log_level_omitted_from_yaml_defaults_to_info() {
+        let contents = r#"
+listen:
+  tcp: "0.0.0.0:8081"
+clients: []
+"#;
+        let configuration: Configuration = serde_saphyr::from_str(contents).unwrap();
+        assert_eq!(configuration.log_level, LogLevelConfiguration::Info);
+    }
+
+    #[test]
+    fn log_level_converts_to_the_matching_tracing_level() {
+        assert_eq!(
+            tracing::Level::from(LogLevelConfiguration::Debug),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(
+            tracing::Level::from(LogLevelConfiguration::Info),
+            tracing::Level::INFO
+        );
+        assert_eq!(
+            tracing::Level::from(LogLevelConfiguration::Warn),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            tracing::Level::from(LogLevelConfiguration::Error),
+            tracing::Level::ERROR
+        );
+    }
+
+    #[test]
+    fn from_file_reads_and_parses_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+listen:
+  tcp: "127.0.0.1:9000"
+clients: []
+"#,
+        )
+        .unwrap();
+
+        let configuration = Configuration::from_file(&path).unwrap();
+        let Tcp(addr) = configuration.listen else {
+            panic!("Expected Tcp configuration");
+        };
+        assert_eq!(addr.port(), 9000);
+    }
+
+    #[test]
+    fn from_file_errors_cleanly_on_a_missing_file() {
+        let path = PathBuf::from("/nonexistent/path/to/config.yaml");
+        let result = Configuration::from_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_file_errors_cleanly_on_malformed_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "not: [valid, config").unwrap();
+
+        let result = Configuration::from_file(&path);
+        assert!(result.is_err());
+    }
 }
