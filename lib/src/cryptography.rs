@@ -4,7 +4,15 @@ use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::ed25519::signature::rand_core::OsRng;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct ClientKey {
     pub client_name: String,
     pub key: Vec<u8>,
@@ -17,10 +25,20 @@ pub struct Claims {
 }
 
 impl ClientKey {
+    /// JSON is the current key format (see `client_key_wire_format_is_plain_base64_json`
+    /// below) and what `Keygen::private_key_base64` writes for any key generated
+    /// today. But keys generated before that migration were written with rkyv, a
+    /// binary format, and holders of those keys shouldn't be forced to re-run
+    /// `orosu-keygen` just to keep working — so a value that isn't valid JSON is
+    /// retried as rkyv before giving up. New keys are never written as rkyv; this
+    /// is a read-only compatibility path, not a second write format.
     pub fn from_string(value: String) -> anyhow::Result<Self> {
-        let key = STANDARD.decode(value).context("invalid key format")?;
-        let key = serde_json::from_slice::<Self>(&key).context("invalid key format")?;
-        Ok(key)
+        let bytes = STANDARD.decode(value).context("invalid key format")?;
+        if let Ok(key) = serde_json::from_slice::<Self>(&bytes) {
+            return Ok(key);
+        }
+        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid key format"))
     }
 }
 
@@ -80,9 +98,12 @@ mod tests {
         assert_eq!(parsed.key, keygen.private_key().key);
     }
 
-    // Locks in the wire format the JS action (client/src/auth.js) depends
-    // on: base64(JSON({"client_name": string, "key": [u8; 32]})), not rkyv
-    // or any other binary encoding.
+    // Locks in the format newly generated keys are written in, and that the
+    // JS action (client/src/auth.js) depends on: base64(JSON({"client_name":
+    // string, "key": [u8; 32]})). `from_string` also reads the older rkyv
+    // format (see `reads_a_key_written_in_the_old_rkyv_format` below), but
+    // that's a read-only compatibility path — Keygen must never start
+    // writing rkyv again.
     #[test]
     fn client_key_wire_format_is_plain_base64_json() {
         let keygen = Keygen::new("wire-format-client".to_string());
@@ -105,6 +126,32 @@ mod tests {
     #[test]
     fn from_string_rejects_valid_base64_that_is_not_the_expected_json_shape() {
         let garbage = STANDARD.encode(b"{\"unexpected\":\"shape\"}");
+        let result = ClientKey::from_string(garbage);
+        assert!(result.is_err());
+    }
+
+    // Keys generated before the JSON migration were written with rkyv, a
+    // binary format — holders of those keys shouldn't be forced to re-run
+    // orosu-keygen just to keep working. This locks in that from_string
+    // still reads that old format even though Keygen never writes it again.
+    #[test]
+    fn reads_a_key_written_in_the_old_rkyv_format() {
+        let private_key = ClientKey {
+            client_name: "old-format-client".to_string(),
+            key: vec![1u8; 32],
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&private_key).unwrap();
+        let base64 = STANDARD.encode(encoded);
+
+        let parsed = ClientKey::from_string(base64).unwrap();
+
+        assert_eq!(parsed.client_name, "old-format-client");
+        assert_eq!(parsed.key, vec![1u8; 32]);
+    }
+
+    #[test]
+    fn from_string_rejects_garbage_that_is_neither_json_nor_rkyv() {
+        let garbage = STANDARD.encode(b"\x00\x01\x02not a valid encoding at all\xff\xfe");
         let result = ClientKey::from_string(garbage);
         assert!(result.is_err());
     }

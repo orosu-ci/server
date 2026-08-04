@@ -393,7 +393,13 @@ async fn rejects_a_user_agent_with_the_wrong_product_name() {
 }
 
 #[tokio::test]
-async fn rejects_a_missing_protocol_version_header() {
+async fn treats_a_missing_protocol_version_header_as_version_zero_and_rejects_it() {
+    // A missing header isn't a malformed request — it's every client built
+    // before this header existed (every currently released orosu-client and
+    // JS action). The server treats that as protocol version 0, which
+    // still doesn't match PROTOCOL_VERSION, so the outcome is the same 400
+    // as an explicit wrong version — see auth_scope.rs and
+    // protocol_version.rs's PROTOCOL_VERSION doc comment.
     let port = 19117;
     let key_dir = tempfile::tempdir().unwrap();
     let keygen = Keygen::new("test-client".to_string());

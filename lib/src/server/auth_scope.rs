@@ -52,27 +52,31 @@ impl FromRequestParts<Arc<ServerState>> for AuthContext {
         // bad credential are different problems needing different fixes
         // (upgrade software vs. rotate a key), so this gets its own status
         // code (400) rather than folding into the 401s below.
-        let Some(protocol_version_header) = parts
+        //
+        // A missing header isn't a malformed request — it's every client
+        // built before this header existed, which is version 0 by
+        // definition (see PROTOCOL_VERSION's doc comment). Folding it into
+        // the same version-mismatch path as an explicit wrong version, and
+        // never a separate "header is missing" case, keeps the log message
+        // meaningful for what's currently the overwhelmingly common case.
+        let client_protocol_version = match parts
             .headers
             .get(HeaderName::from_static(PROTOCOL_VERSION_HEADER_NAME))
-        else {
-            tracing::error!("Protocol version header is missing");
-            return Err(StatusCode::BAD_REQUEST);
-        };
-
-        let protocol_version_header: ProtocolVersionHeader =
-            match protocol_version_header.try_into() {
-                Ok(value) => value,
+        {
+            None => 0,
+            Some(header_value) => match ProtocolVersionHeader::try_from(header_value) {
+                Ok(value) => value.version,
                 Err(e) => {
                     tracing::error!("Unexpected protocol version header format: {e}");
                     return Err(StatusCode::BAD_REQUEST);
                 }
-            };
+            },
+        };
 
-        if protocol_version_header.version != PROTOCOL_VERSION {
+        if client_protocol_version != PROTOCOL_VERSION {
             tracing::error!(
                 "Client protocol version {} does not match server protocol version {}",
-                protocol_version_header.version,
+                client_protocol_version,
                 PROTOCOL_VERSION
             );
             return Err(StatusCode::BAD_REQUEST);

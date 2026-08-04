@@ -5,6 +5,12 @@ use axum::http::HeaderValue;
 /// envelope/handshake contract changes in a way that breaks compatibility
 /// with a client or server built against the previous value — see
 /// server/auth_scope.rs's exact-match check, which rejects anything else.
+///
+/// Version 0 is implicit, not a value anything ever sends on purpose: every
+/// client built before this header existed (which is every currently
+/// released `orosu-client` and JS action, as of introducing this) sends no
+/// `Orosu-Protocol-Version` header at all. The server treats that absence
+/// as version 0 rather than a malformed request — see auth_scope.rs.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Shared by both the sending (api/client.rs) and receiving
