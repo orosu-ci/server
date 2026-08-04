@@ -1,4 +1,4 @@
-use crate::api::protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER_NAME};
+use crate::api::protocol_version::{PROTOCOL_VERSION_HEADER_NAME, SUPPORTED_PROTOCOL_VERSIONS};
 use crate::api::{ProtocolVersionHeader, UserAgentHeader};
 use crate::cryptography::Claims;
 use crate::server::{AuthContext, AuthScope, ServerState, WorkerAuthContext};
@@ -48,16 +48,16 @@ impl FromRequestParts<Arc<ServerState>> for AuthContext {
             }
         };
 
-        // Checked separately from auth on purpose: a version mismatch and a
-        // bad credential are different problems needing different fixes
+        // Checked separately from auth on purpose: an unsupported version and
+        // a bad credential are different problems needing different fixes
         // (upgrade software vs. rotate a key), so this gets its own status
         // code (400) rather than folding into the 401s below.
         //
         // A missing header isn't a malformed request — it's every client
         // built before this header existed, which is version 0 by
         // definition (see PROTOCOL_VERSION's doc comment). Folding it into
-        // the same version-mismatch path as an explicit wrong version, and
-        // never a separate "header is missing" case, keeps the log message
+        // the same version-check path as an explicit version, and never a
+        // separate "header is missing" case, keeps the log message
         // meaningful for what's currently the overwhelmingly common case.
         let client_protocol_version = match parts
             .headers
@@ -73,11 +73,15 @@ impl FromRequestParts<Arc<ServerState>> for AuthContext {
             },
         };
 
-        if client_protocol_version != PROTOCOL_VERSION {
+        // Accepts a *set* of versions, not just the current one, so that
+        // clients built against the previous version keep working while a
+        // rollout is in progress — see SUPPORTED_PROTOCOL_VERSIONS's doc
+        // comment for why version 0 specifically can't be dropped yet.
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&client_protocol_version) {
             tracing::error!(
-                "Client protocol version {} does not match server protocol version {}",
+                "Client protocol version {} is not supported by this server (supported: {:?})",
                 client_protocol_version,
-                PROTOCOL_VERSION
+                SUPPORTED_PROTOCOL_VERSIONS
             );
             return Err(StatusCode::BAD_REQUEST);
         }
