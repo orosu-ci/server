@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["lib", "client", "server", "keygen"]
+members = ["lib", "server", "keygen"]
 
 
 [workspace.package]
