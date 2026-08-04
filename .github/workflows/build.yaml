@@ -166,7 +166,12 @@ jobs:
           key: ${{ secrets.OROSU_SECRET }}
           script: deploy-deb-to-repo
           chunk_size: 131072
-          arguments: stable
+          # orosu-ci/orosu (the JS action) names this input `args`, not
+          # `arguments` (that's api/action.yml's composite-action name) — see
+          # the update-version-tags fix above for why this distinction now
+          # actually matters: @v0 previously resolved here regardless of
+          # which input name was used because of the tag collision.
+          args: stable
           file: |-
             packages/*.deb
 
@@ -188,26 +193,30 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           MAJOR=$(echo $VERSION | cut -d. -f1)
           MINOR=$(echo $VERSION | cut -d. -f1-2)
-          
-          echo "major=v${MAJOR}" >> $GITHUB_OUTPUT
-          echo "minor=v${MINOR}" >> $GITHUB_OUTPUT
+
+          # Namespaced under server/ so these never collide with the action
+          # branch's own floating v0/v0.X tags (orosu-ci/orosu@v0 must
+          # resolve to the JS action, not a orosu-server/orosu-client release
+          # commit on this branch — see the action branch's publish workflow).
+          echo "major=server/v${MAJOR}" >> $GITHUB_OUTPUT
+          echo "minor=server/v${MINOR}" >> $GITHUB_OUTPUT
           echo "full=v${VERSION}" >> $GITHUB_OUTPUT
-          
-          echo "Major tag: v${MAJOR}"
-          echo "Minor tag: v${MINOR}"
+
+          echo "Major tag: server/v${MAJOR}"
+          echo "Minor tag: server/v${MINOR}"
           echo "Full tag: v${VERSION}"
 
       - name: Update major and minor tags
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Update major tag (e.g., v0)
+
+          # Update major tag (e.g., server/v0)
           git tag -f ${{ steps.version.outputs.major }}
           git push -f origin ${{ steps.version.outputs.major }}
-          
-          # Update minor tag (e.g., v0.2)
+
+          # Update minor tag (e.g., server/v0.2)
           git tag -f ${{ steps.version.outputs.minor }}
           git push -f origin ${{ steps.version.outputs.minor }}
-          
+
           echo "✅ Updated tags: ${{ steps.version.outputs.major }} and ${{ steps.version.outputs.minor }}"
