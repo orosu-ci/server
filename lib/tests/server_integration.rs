@@ -395,13 +395,15 @@ async fn rejects_a_user_agent_with_the_wrong_product_name() {
 }
 
 #[tokio::test]
-async fn treats_a_missing_protocol_version_header_as_version_zero_and_rejects_it() {
+async fn treats_a_missing_protocol_version_header_as_version_zero_and_accepts_it() {
     // A missing header isn't a malformed request — it's every client built
     // before this header existed (every currently released orosu-client and
-    // JS action). The server treats that as protocol version 0, which
-    // still doesn't match PROTOCOL_VERSION, so the outcome is the same 400
-    // as an explicit wrong version — see auth_scope.rs and
-    // protocol_version.rs's PROTOCOL_VERSION doc comment.
+    // JS action, and the still-live pre-rewrite orosu-ci/orosu@v0 action).
+    // The server treats that as protocol version 0, which stays in
+    // SUPPORTED_PROTOCOL_VERSIONS alongside the current PROTOCOL_VERSION —
+    // dropping it would reject that live traffic outright. Full round trip,
+    // not just a successful handshake, confirms it's genuinely accepted
+    // rather than merely not rejected at connect time.
     let port = 19117;
     let key_dir = tempfile::tempdir().unwrap();
     let keygen = Keygen::new("test-client".to_string());
@@ -410,22 +412,20 @@ async fn treats_a_missing_protocol_version_header_as_version_zero_and_rejects_it
 
     let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
     let token = sign_jwt("test-client", &client_key.key, 10);
-    let result = connect_raw_with_protocol_version(
+    let mut ws = connect_raw_with_protocol_version(
         port,
         Some(&format!("Token {token}")),
         Some("Orosu/x"),
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
-    // Distinct from the 401s used for actual auth failures above — a
-    // version mismatch and a bad credential need different fixes.
-    let err = result.unwrap_err();
-    assert_eq!(rejection_status(&err), Some(400));
+    launch_without_file(&mut ws, "hello", vec![]).await;
 }
 
 #[tokio::test]
-async fn rejects_a_protocol_version_that_does_not_match_the_servers() {
+async fn rejects_a_protocol_version_that_is_not_supported_by_the_server() {
     let port = 19118;
     let key_dir = tempfile::tempdir().unwrap();
     let keygen = Keygen::new("test-client".to_string());
@@ -434,6 +434,8 @@ async fn rejects_a_protocol_version_that_does_not_match_the_servers() {
 
     let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
     let token = sign_jwt("test-client", &client_key.key, 10);
+    // One past the newest version this build knows about — outside
+    // SUPPORTED_PROTOCOL_VERSIONS regardless of how many versions it lists.
     let wrong_version = (PROTOCOL_VERSION + 1).to_string();
     let result = connect_raw_with_protocol_version(
         port,

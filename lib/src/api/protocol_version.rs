@@ -1,17 +1,28 @@
 use crate::api::ProtocolVersionHeader;
 use axum::http::HeaderValue;
 
-/// The wire-protocol version this crate speaks. Bump this whenever the
-/// envelope/handshake contract changes in a way that breaks compatibility
-/// with a client or server built against the previous value — see
-/// server/auth_scope.rs's exact-match check, which rejects anything else.
+/// The wire-protocol version this crate's client sends. Bump this whenever
+/// the envelope/handshake contract changes in a way that breaks
+/// compatibility with a server built against the previous value — and add
+/// the new value to `SUPPORTED_PROTOCOL_VERSIONS` below so the server can
+/// keep accepting the version it's replacing.
 ///
 /// Version 0 is implicit, not a value anything ever sends on purpose: every
-/// client built before this header existed (which is every currently
-/// released `orosu-client` and JS action, as of introducing this) sends no
+/// client built before this header existed sends no
 /// `Orosu-Protocol-Version` header at all. The server treats that absence
 /// as version 0 rather than a malformed request — see auth_scope.rs.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Every protocol version this server will currently accept a client
+/// speaking — not just the one this crate's own client sends
+/// (`PROTOCOL_VERSION`). Version 0 has to stay listed until every
+/// currently-deployed client (including, as of introducing this header,
+/// every already-published `orosu-client` binary and JS action — none of
+/// which send this header at all) has actually been upgraded; dropping it
+/// here would reject that live traffic outright rather than let it
+/// interoperate during the rollout. See server/auth_scope.rs for the check
+/// that uses this.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[0, PROTOCOL_VERSION];
 
 /// Shared by both the sending (api/client.rs) and receiving
 /// (server/auth_scope.rs) sides, so they can't drift on the literal string.
@@ -51,6 +62,12 @@ mod tests {
     fn default_uses_the_crate_protocol_version() {
         let header = ProtocolVersionHeader::default();
         assert_eq!(header.version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn supported_protocol_versions_includes_both_the_legacy_implicit_version_and_the_current_one() {
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&0));
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION));
     }
 
     #[test]
