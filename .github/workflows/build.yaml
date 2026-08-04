@@ -178,3 +178,18 @@ jobs:
           arguments: stable
           file: |-
             packages/*.deb
+
+  self-restart:
+    # deploy-packages runs as an amd64/arm64 matrix, publishing to the same
+    # repo twice — this job needs the whole matrix (both legs), not a step
+    # inside it, so the restart only fires once after both have finished.
+    needs: deploy-packages
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Restart orosu-server to pick up the newly deployed version
+        uses: orosu-ci/orosu@v0
+        with:
+          address: ${{ secrets.OROSU_HOST }}
+          key: ${{ secrets.OROSU_SECRET }}
+          script: self-restart
