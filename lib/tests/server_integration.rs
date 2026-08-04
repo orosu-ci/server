@@ -14,6 +14,8 @@
 //! `Server::serve()` doesn't expose the OS-assigned port when binding to
 //! `:0`, so each test picks its own fixed, distinct port.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use futures_util::{SinkExt, StreamExt};
@@ -693,6 +695,44 @@ async fn per_client_whitelist_allows_a_matching_ip() {
     // whitelist doesn't just avoid the 403 but leaves the rest working.
     let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
     launch_without_file(&mut ws, "hello", vec![]).await;
+}
+
+/// Full-stack proof that `ClientKey::from_string`'s rkyv fallback
+/// (cryptography.rs) isn't just a parsing detail: a private key written in
+/// the pre-JSON-migration binary format still authenticates against a real
+/// server and runs a script end to end, exactly like a JSON-format key does
+/// in `happy_path_launches_streams_output_and_exit_code`.
+#[tokio::test]
+async fn a_client_key_written_in_the_old_rkyv_format_still_authenticates_end_to_end() {
+    let port = 19119;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(single_client_config(port, &public_key_path, ""), port).await;
+
+    let old_format_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(keygen.private_key()).unwrap();
+    let old_format_key_base64 = STANDARD.encode(old_format_bytes);
+
+    let client_key = ClientKey::from_string(old_format_key_base64).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    launch_without_file(&mut ws, "hello", vec![]).await;
+
+    loop {
+        match recv_task_event(&mut ws).await {
+            Some(TaskEventResponseEnvelope::Success {
+                body: ServerTaskNotification::ExitCode(code),
+            }) => {
+                assert_eq!(code, 0);
+                break;
+            }
+            Some(TaskEventResponseEnvelope::Success {
+                body: ServerTaskNotification::Output(_),
+            }) => {}
+            Some(other) => panic!("unexpected event: {other:?}"),
+            None => panic!("connection closed before an exit code arrived"),
+        }
+    }
 }
 
 #[tokio::test]
