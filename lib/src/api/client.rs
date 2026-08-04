@@ -4,13 +4,14 @@ use crate::api::envelopes::{
 };
 use crate::api::file_chunk::AttachedFiles;
 use crate::api::{
-    FileAttachment, ServerErrorResponse, ServerTaskNotification, StartTaskRequest,
-    TaskLaunchStatus, UserAgentHeader,
+    FileAttachment, ProtocolVersionHeader, ServerErrorResponse, ServerTaskNotification,
+    StartTaskRequest, TaskLaunchStatus, UserAgentHeader,
 };
 use crate::cryptography::{Claims, ClientKey};
 use crate::server_address::ServerAddress;
 use crate::tasks::TaskOutput;
 use anyhow::Context;
+use axum::http::HeaderName;
 use axum::http::header::{AUTHORIZATION, USER_AGENT};
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -54,6 +55,7 @@ impl ApiClient {
         let token = encode(&header, &claims, &encoding_key).context("cannot encode JWT")?;
 
         let user_agent_header = UserAgentHeader::default();
+        let protocol_version_header = ProtocolVersionHeader::default();
         let mut request = endpoint
             .clone()
             .into_client_request()
@@ -64,6 +66,10 @@ impl ApiClient {
         request
             .headers_mut()
             .insert(USER_AGENT, user_agent_header.into());
+        request.headers_mut().insert(
+            HeaderName::from_static(crate::api::protocol_version::PROTOCOL_VERSION_HEADER_NAME),
+            protocol_version_header.into(),
+        );
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(request)
             .await

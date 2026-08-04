@@ -1,8 +1,10 @@
-use crate::api::UserAgentHeader;
+use crate::api::protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER_NAME};
+use crate::api::{ProtocolVersionHeader, UserAgentHeader};
 use crate::cryptography::Claims;
 use crate::server::{AuthContext, AuthScope, ServerState, WorkerAuthContext};
 use axum::Extension;
 use axum::extract::FromRequestParts;
+use axum::http::HeaderName;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -45,6 +47,40 @@ impl FromRequestParts<Arc<ServerState>> for AuthContext {
                 return Err(StatusCode::UNAUTHORIZED);
             }
         };
+
+        // Checked separately from auth on purpose: a version mismatch and a
+        // bad credential are different problems needing different fixes
+        // (upgrade software vs. rotate a key), so this gets its own status
+        // code (400) rather than folding into the 401s below.
+        //
+        // A missing header isn't a malformed request — it's every client
+        // built before this header existed, which is version 0 by
+        // definition (see PROTOCOL_VERSION's doc comment). Folding it into
+        // the same version-mismatch path as an explicit wrong version, and
+        // never a separate "header is missing" case, keeps the log message
+        // meaningful for what's currently the overwhelmingly common case.
+        let client_protocol_version = match parts
+            .headers
+            .get(HeaderName::from_static(PROTOCOL_VERSION_HEADER_NAME))
+        {
+            None => 0,
+            Some(header_value) => match ProtocolVersionHeader::try_from(header_value) {
+                Ok(value) => value.version,
+                Err(e) => {
+                    tracing::error!("Unexpected protocol version header format: {e}");
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            },
+        };
+
+        if client_protocol_version != PROTOCOL_VERSION {
+            tracing::error!(
+                "Client protocol version {} does not match server protocol version {}",
+                client_protocol_version,
+                PROTOCOL_VERSION
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         match scope {
             AuthScope::Worker => {

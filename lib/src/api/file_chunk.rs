@@ -113,3 +113,137 @@ impl AttachedFiles {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp_file(dir: &std::path::Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        let mut f = File::create(&path).unwrap();
+        f.write_all(contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn from_input_ignores_blank_and_whitespace_only_entries() {
+        let attached = AttachedFiles::from_input(vec!["   ".to_string(), "".to_string()]);
+        assert!(attached.paths.is_empty());
+    }
+
+    #[test]
+    fn from_input_globs_and_flattens_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        write_temp_file(dir.path(), "a.txt", b"a");
+        write_temp_file(dir.path(), "b.txt", b"b");
+        write_temp_file(dir.path(), "c.dat", b"c");
+
+        let pattern = format!("{}/*.txt", dir.path().display());
+        let attached = AttachedFiles::from_input(vec![pattern]);
+
+        let names: Vec<_> = attached
+            .paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(names.contains(&"b.txt".to_string()));
+    }
+
+    #[test]
+    fn from_input_skips_a_pattern_that_matches_nothing_without_erroring() {
+        let attached = AttachedFiles::from_input(vec!["/nonexistent/path/*.nope".to_string()]);
+        assert!(attached.paths.is_empty());
+    }
+
+    #[test]
+    fn chunks_hash_matches_an_independently_computed_md5_of_the_full_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_temp_file(
+            dir.path(),
+            "sample.txt",
+            b"hello world, this is a test attachment",
+        );
+        let attached = AttachedFiles { paths: vec![file] };
+
+        let result = attached.chunks(65536).unwrap();
+        assert_eq!(result.chunks.len(), 1);
+        assert_eq!(result.chunks[0].offset, 0);
+        assert_eq!(result.chunks[0].data.len(), result.size);
+
+        let recomputed = md5::compute(&result.chunks[0].data).0.to_vec();
+        assert_eq!(recomputed, result.hash);
+    }
+
+    #[test]
+    fn chunks_are_contiguous_and_the_last_one_may_be_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_temp_file(dir.path(), "sample.txt", &[b'X'; 100]);
+        let attached = AttachedFiles { paths: vec![file] };
+
+        let result = attached.chunks(30).unwrap();
+        assert!(result.chunks.len() > 1);
+
+        let mut offset = 0;
+        let mut rebuilt = Vec::new();
+        for chunk in &result.chunks {
+            assert_eq!(chunk.offset, offset);
+            offset += chunk.data.len();
+            rebuilt.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(offset, result.size);
+        assert_eq!(md5::compute(&rebuilt).0.to_vec(), result.hash);
+
+        let last = result.chunks.last().unwrap();
+        assert!(last.data.len() <= 30);
+        for chunk in &result.chunks[..result.chunks.len() - 1] {
+            assert_eq!(chunk.data.len(), 30);
+        }
+    }
+
+    #[test]
+    fn archive_flattens_paths_to_basenames_in_the_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let file = write_temp_file(&nested, "deep.txt", b"content");
+
+        let attached = AttachedFiles { paths: vec![file] };
+        let result = attached.chunks(65536).unwrap();
+        let full_buffer: Vec<u8> = result.chunks.iter().flat_map(|c| c.data.clone()).collect();
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(full_buffer)).unwrap();
+        assert_eq!(archive.len(), 1);
+        let entry = archive.by_index(0).unwrap();
+        assert_eq!(entry.name(), "deep.txt");
+    }
+
+    // Unlike the JS action (client/src/files.js), which treats "no files
+    // matched" as "no attachment at all" and never builds a zip, the
+    // server-side archive() has no such short-circuit — a zero-file
+    // AttachedFiles still produces a valid (if tiny) zip archive with just
+    // end-of-central-directory overhead.
+    #[test]
+    fn chunks_on_zero_matched_files_still_produces_a_valid_small_archive() {
+        let attached = AttachedFiles { paths: vec![] };
+        let result = attached.chunks(65536).unwrap();
+        assert_eq!(result.chunks.len(), 1);
+        assert!(result.size > 0);
+        let archive =
+            zip::ZipArchive::new(std::io::Cursor::new(result.chunks[0].data.clone())).unwrap();
+        assert_eq!(archive.len(), 0);
+    }
+
+    #[test]
+    fn file_attachment_from_chunk_result_captures_hash_and_size() {
+        let result = FileChunkResult {
+            chunks: vec![],
+            hash: vec![9, 9, 9],
+            size: 123,
+        };
+        let attachment: FileAttachment = (&result).into();
+        assert_eq!(attachment.hash, vec![9, 9, 9]);
+        assert_eq!(attachment.size, 123);
+    }
+}

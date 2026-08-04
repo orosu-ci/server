@@ -154,3 +154,155 @@ impl Task {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Duration;
+
+    fn script(command: Vec<&str>) -> Script {
+        Script {
+            name: "test-script".to_string(),
+            run_as: None,
+            command: command.into_iter().map(String::from).collect(),
+        }
+    }
+
+    async fn next_output(rx: &mut mpsc::Receiver<Timestamped<TaskOutput>>) -> TaskOutput {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for a task output event")
+            .expect("output channel closed unexpectedly")
+            .value
+    }
+
+    #[tokio::test]
+    async fn run_streams_stdout_and_resolves_the_exit_code() {
+        let mut task = Task::create(script(vec!["echo", "hello from stdout"]));
+        let result = task.run(vec![], None).await.unwrap();
+
+        let event = next_output(&mut task.output_rx).await;
+        let TaskOutput::Stdout(line) = event else {
+            panic!("expected Stdout, got {event:?}");
+        };
+        assert_eq!(line, "hello from stdout");
+
+        let exit_code = result.handler.await.unwrap();
+        assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn run_streams_stderr() {
+        let mut task = Task::create(script(vec!["bash", "-c", "echo oops >&2"]));
+        let result = task.run(vec![], None).await.unwrap();
+
+        let event = next_output(&mut task.output_rx).await;
+        let TaskOutput::Stderr(line) = event else {
+            panic!("expected Stderr, got {event:?}");
+        };
+        assert_eq!(line, "oops");
+
+        assert_eq!(result.handler.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_resolves_a_non_zero_exit_code() {
+        let task = Task::create(script(vec!["bash", "-c", "exit 3"]));
+        let result = task.run(vec![], None).await.unwrap();
+        assert_eq!(result.handler.await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn run_appends_extra_arguments_after_the_script_commands_own_args() {
+        let mut task = Task::create(script(vec!["echo"]));
+        let result = task
+            .run(vec!["hello".to_string(), "world".to_string()], None)
+            .await
+            .unwrap();
+
+        let event = next_output(&mut task.output_rx).await;
+        let TaskOutput::Stdout(line) = event else {
+            panic!("expected Stdout, got {event:?}");
+        };
+        assert_eq!(line, "hello world");
+        assert_eq!(result.handler.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_exposes_the_attachments_directory_as_an_env_var() {
+        let attachments = TempDir::new().unwrap();
+        let expected_path = attachments.path().to_path_buf();
+
+        let mut task = Task::create(script(vec!["bash", "-c", "echo $ATTACHMENTS_DIR"]));
+        let result = task.run(vec![], Some(attachments)).await.unwrap();
+
+        let event = next_output(&mut task.output_rx).await;
+        let TaskOutput::Stdout(line) = event else {
+            panic!("expected Stdout, got {event:?}");
+        };
+        assert_eq!(line, expected_path.display().to_string());
+        assert_eq!(result.handler.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_rejects_an_empty_command_without_spawning_anything() {
+        let task = Task::create(script(vec![]));
+        let result = task.run(vec![], None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_reports_a_spawn_failure_as_both_an_error_and_a_stderr_event() {
+        let mut task = Task::create(script(vec!["/nonexistent/definitely-not-a-real-binary"]));
+        let result = task.run(vec![], None).await;
+        assert!(result.is_err());
+
+        let event = next_output(&mut task.output_rx).await;
+        let TaskOutput::Stderr(line) = event else {
+            panic!("expected Stderr, got {event:?}");
+        };
+        assert!(line.starts_with("Failed to start script:"));
+    }
+
+    #[tokio::test]
+    async fn run_with_a_nonexistent_run_as_user_fails_before_spawning() {
+        let mut script = script(vec!["echo", "should not run"]);
+        script.run_as = Some("definitely-not-a-real-user-3f8a91".to_string());
+        let task = Task::create(script);
+        let result = task.run(vec![], None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_reports_signal_termination_as_exit_code_negative_one() {
+        let mut task = Task::create(script(vec!["bash", "-c", "kill -9 $$"]));
+        let result = task.run(vec![], None).await.unwrap();
+
+        let event = next_output(&mut task.output_rx).await;
+        let TaskOutput::Stderr(line) = event else {
+            panic!("expected Stderr, got {event:?}");
+        };
+        assert_eq!(line, "Command terminated by signal");
+
+        assert_eq!(result.handler.await.unwrap(), -1);
+    }
+
+    // Documents real, currently-existing (harmless) dead code: Task::create
+    // immediately drops the watch::channel's receiver
+    // (`let (exit_code_tx, _) = watch::channel(None)`), so
+    // set_exit_code's `tx.send(...)` can never succeed — every task run
+    // logs a spurious "Failed to send task exit code: channel closed"
+    // error, which is exactly the log line seen during manual verification
+    // earlier. It's inert, not a race: the real exit code is delivered via
+    // the JoinHandle return value (asserted above in every other test),
+    // never via this channel. This test just confirms run() completes
+    // successfully regardless — the always-failing send is silently logged
+    // and swallowed, not propagated as an error.
+    #[tokio::test]
+    async fn run_succeeds_even_though_the_internal_exit_code_watch_channel_has_no_receiver() {
+        let task = Task::create(script(vec!["true"]));
+        let result = task.run(vec![], None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().handler.await.unwrap(), 0);
+    }
+}

@@ -68,3 +68,78 @@ pub type TaskLaunchStatusResponseEnvelope = ResponseEnvelope<TaskLaunchStatus, S
 pub type TaskEventResponseEnvelope =
     ResponseEnvelope<ServerTaskNotification<Timestamped<TaskOutput>, i32>, ServerErrorResponse>;
 pub type TaskLaunchRequestEnvelope = RequestEnvelope<StartTaskRequest>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_envelope_wraps_body_and_round_trips_through_bytes() {
+        let envelope = RequestEnvelope {
+            body: "hello".to_string(),
+        };
+        let bytes: Bytes = envelope.into();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!({"body": "hello"})
+        );
+
+        let round_tripped: RequestEnvelope<String> = bytes.into();
+        assert_eq!(round_tripped.body, "hello");
+    }
+
+    #[test]
+    fn response_envelope_success_round_trips_through_bytes() {
+        let envelope: ResponseEnvelope<i32, String> = ResponseEnvelope::Success { body: 42 };
+        let bytes: Bytes = envelope.into();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!({"success": {"body": 42}})
+        );
+
+        let round_tripped: ResponseEnvelope<i32, String> = bytes.into();
+        match round_tripped {
+            ResponseEnvelope::Success { body } => assert_eq!(body, 42),
+            ResponseEnvelope::Failure { .. } => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn response_envelope_failure_round_trips_through_bytes() {
+        let envelope: ResponseEnvelope<i32, String> = ResponseEnvelope::Failure {
+            error: "oops".to_string(),
+        };
+        let bytes: Bytes = envelope.into();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!({"failure": {"error": "oops"}})
+        );
+    }
+
+    // Documents current, deliberate behavior: these Bytes<->Envelope
+    // conversions are used client-side (api/client.rs) to trust server
+    // responses, and panic on malformed input rather than returning an
+    // error. The server instead hand-parses untrusted client bytes with
+    // graceful Ok/Err handling (server/handler/tasks.rs), never going
+    // through this conversion for anything client-supplied. If that ever
+    // changes, this test should fail and prompt reconsidering the choice.
+    #[test]
+    #[should_panic]
+    fn malformed_bytes_panics_rather_than_returning_an_error() {
+        let bytes = Bytes::from_static(b"not json");
+        let _: RequestEnvelope<String> = bytes.into();
+    }
+
+    #[test]
+    fn file_chunk_request_envelope_type_alias_round_trips() {
+        let chunk = FileChunk {
+            offset: 16,
+            data: vec![1, 2, 3],
+        };
+        let envelope = FileChunkRequestEnvelope { body: chunk };
+        let bytes: Bytes = envelope.into();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value, json!({"body": {"offset": 16, "data": [1, 2, 3]}}));
+    }
+}
