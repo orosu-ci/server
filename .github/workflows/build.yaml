@@ -166,8 +166,15 @@ jobs:
           key: ${{ secrets.OROSU_SECRET }}
           script: deploy-deb-to-repo
           chunk_size: 131072
-          # orosu-ci/orosu (the JS action) names this input `args`, not
-          # `arguments` (that's api/action.yml's composite-action name).
-          args: stable
+          # orosu-ci/orosu@v0 currently still resolves to the old, pre-JS-
+          # rewrite composite action (v0 == v0.4.0, confirmed via
+          # `git merge-base --is-ancestor js-action v0` returning false in
+          # the client/ repo) — that action's input is named `arguments`,
+          # not `args`. The new JS action (client/, `js-action` branch) does
+          # use `args`, but it hasn't been published and `v0` hasn't been
+          # moved to it yet. Switch this back to `args` once that happens —
+          # using the wrong name here fails silently (unrecognized input,
+          # script gets zero arguments) rather than erroring.
+          arguments: stable
           file: |-
             packages/*.deb
