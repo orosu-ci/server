@@ -15,6 +15,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use futures_util::{SinkExt, StreamExt};
@@ -24,16 +25,20 @@ use orosu::api::envelopes::{
     TaskLaunchStatusResponseEnvelope,
 };
 use orosu::api::file_chunk::FileChunk;
-use orosu::api::protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER_NAME};
+use orosu::api::handshake::{ConnectionSecurity, SessionKeys, verify_confirmation_frame};
+use orosu::api::protocol_version::{
+    PROTOCOL_VERSION, PROTOCOL_VERSION_ENCRYPTED_V2, PROTOCOL_VERSION_HEADER_NAME,
+};
 use orosu::api::{FileAttachment, ServerTaskNotification, StartTaskRequest, TaskLaunchStatus};
 use orosu::configuration::Configuration;
-use orosu::cryptography::{ClientKey, Keygen};
+use orosu::cryptography::{ClientKey, Keygen, ServerKeygen, ServerStaticKey};
 use orosu::server::Server;
 use std::io::Write;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 fn build_config(yaml: &str) -> Configuration {
     serde_saphyr::from_str(yaml).unwrap()
@@ -52,13 +57,23 @@ async fn wait_for_port(port: u16) {
     panic!("server on port {port} never became reachable");
 }
 
+// Loads encryption_key_file the same way api/server/src/main.rs does. No
+// existing test's config sets this field, so encryption_key stays None for
+// every test above this point — proving, structurally rather than just by
+// assertion, that a server binary upgrade changes nothing for a deployment
+// that hasn't opted into encryption.
 async fn spawn_server(configuration: Configuration, port: u16) {
+    let encryption_key = configuration
+        .encryption_key_file
+        .as_ref()
+        .map(|path| ServerStaticKey::from_file(path).unwrap());
     tokio::spawn(async move {
         let server = Server::new(
             configuration.listen,
             configuration.ip_whitelist,
             configuration.ip_blacklist,
             configuration.clients,
+            encryption_key,
         );
         let _ = server.serve().await;
     });
@@ -68,6 +83,12 @@ async fn spawn_server(configuration: Configuration, port: u16) {
 fn write_public_key(dir: &std::path::Path, keygen: &Keygen) -> std::path::PathBuf {
     let path = dir.join("public.key");
     std::fs::write(&path, keygen.public_key_base64()).unwrap();
+    path
+}
+
+fn write_server_key(dir: &std::path::Path, keygen: &ServerKeygen) -> std::path::PathBuf {
+    let path = dir.join("server.key");
+    std::fs::write(&path, keygen.private_key_base64()).unwrap();
     path
 }
 
@@ -811,6 +832,249 @@ async fn global_whitelist_rejects_a_non_matching_ip() {
     let result = connect_raw(port, None, Some("Orosu/x")).await;
     let err = result.unwrap_err();
     assert_eq!(rejection_status(&err), Some(403));
+}
+
+fn config_with_encryption(
+    port: u16,
+    public_key_path: &std::path::Path,
+    server_key_path: &std::path::Path,
+) -> Configuration {
+    build_config(&format!(
+        r#"
+listen:
+  tcp: "127.0.0.1:{port}"
+encryption_key_file: "{}"
+clients:
+  - name: "test-client"
+    secret_file: "{}"
+    scripts:
+      - name: "hello"
+        command: ["echo", "hi"]
+"#,
+        server_key_path.display(),
+        public_key_path.display()
+    ))
+}
+
+fn server_public_key(keygen: &ServerKeygen) -> PublicKey {
+    let bytes = STANDARD.decode(keygen.public_key_base64()).unwrap();
+    let bytes: [u8; 32] = bytes.as_slice().try_into().unwrap();
+    bytes.into()
+}
+
+/// Connects speaking protocol version 2 and drives the real client-side
+/// handshake through the actual production `api::handshake` module, rather
+/// than a second hand-rolled implementation — unlike `sign_jwt` above
+/// (which deliberately duplicates JWT construction), exercising the real
+/// shared code here is more valuable than reimplementing it; independent
+/// reimplementation testing for the handshake belongs on the JS side (see
+/// client/test/handshake.test.js).
+async fn connect_encrypted(
+    port: u16,
+    client_name: &str,
+    seed: &[u8],
+    server_keygen: &ServerKeygen,
+) -> (WsStream, ConnectionSecurity) {
+    let token = sign_jwt(client_name, seed, 10);
+    let mut ws = connect_raw_with_protocol_version(
+        port,
+        Some(&format!("Token {token}")),
+        Some("Orosu/test-suite"),
+        Some(&PROTOCOL_VERSION_ENCRYPTED_V2.to_string()),
+    )
+    .await
+    .unwrap();
+
+    let client_ephemeral_secret = StaticSecret::random();
+    let client_ephemeral_public = PublicKey::from(&client_ephemeral_secret);
+    ws.send(Message::Binary(
+        client_ephemeral_public.to_bytes().to_vec().into(),
+    ))
+    .await
+    .unwrap();
+
+    let shared = client_ephemeral_secret.diffie_hellman(&server_public_key(server_keygen));
+    let mut session_keys = SessionKeys::derive_for_client(&shared);
+
+    let confirm_msg = ws.next().await.unwrap().unwrap();
+    let Message::Binary(confirm_frame) = confirm_msg else {
+        panic!("expected a binary confirmation frame, got {confirm_msg:?}");
+    };
+    verify_confirmation_frame(&mut session_keys, &confirm_frame).unwrap();
+
+    (ws, ConnectionSecurity::Encrypted(session_keys))
+}
+
+async fn send_launch_secured(
+    ws: &mut WsStream,
+    security: &mut ConnectionSecurity,
+    script: &str,
+    args: Vec<String>,
+    file: Option<FileAttachment>,
+) {
+    let envelope = TaskLaunchRequestEnvelope {
+        body: StartTaskRequest {
+            script_name: script.to_string(),
+            arguments: args,
+            file,
+        },
+    };
+    let plaintext: Bytes = envelope.into();
+    let sealed = security.seal(&plaintext).unwrap();
+    ws.send(Message::Binary(sealed.into())).await.unwrap();
+}
+
+async fn recv_launch_response_secured(
+    ws: &mut WsStream,
+    security: &mut ConnectionSecurity,
+) -> TaskLaunchStatusResponseEnvelope {
+    let msg = ws.next().await.unwrap().unwrap();
+    let Message::Binary(bytes) = msg else {
+        panic!("expected a binary message, got {msg:?}");
+    };
+    let opened = security.open(&bytes).unwrap();
+    Bytes::from(opened).into()
+}
+
+async fn recv_task_event_secured(
+    ws: &mut WsStream,
+    security: &mut ConnectionSecurity,
+) -> Option<TaskEventResponseEnvelope> {
+    match ws.next().await {
+        Some(Ok(Message::Binary(bytes))) => {
+            let opened = security.open(&bytes).unwrap();
+            Some(Bytes::from(opened).into())
+        }
+        Some(Ok(Message::Close(_))) | None => None,
+        Some(Ok(other)) => panic!("expected a binary message or close, got {other:?}"),
+        Some(Err(e)) => panic!("websocket error: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn encrypted_connection_rejects_when_server_has_no_key_configured() {
+    let port = 19120;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    // No encryption_key_file — an unmodified server config, exactly what
+    // an operator has before opting in.
+    spawn_server(single_client_config(port, &public_key_path, ""), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let token = sign_jwt("test-client", &client_key.key, 10);
+    let result = connect_raw_with_protocol_version(
+        port,
+        Some(&format!("Token {token}")),
+        Some("Orosu/x"),
+        Some(&PROTOCOL_VERSION_ENCRYPTED_V2.to_string()),
+    )
+    .await;
+
+    let err = result.unwrap_err();
+    assert_eq!(rejection_status(&err), Some(400));
+}
+
+#[tokio::test]
+async fn encrypted_handshake_with_wrong_pinned_server_key_fails_confirmation() {
+    let port = 19121;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    let server_keygen = ServerKeygen::new();
+    let server_key_path = write_server_key(key_dir.path(), &server_keygen);
+    spawn_server(
+        config_with_encryption(port, &public_key_path, &server_key_path),
+        port,
+    )
+    .await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let token = sign_jwt("test-client", &client_key.key, 10);
+    let mut ws = connect_raw_with_protocol_version(
+        port,
+        Some(&format!("Token {token}")),
+        Some("Orosu/x"),
+        Some(&PROTOCOL_VERSION_ENCRYPTED_V2.to_string()),
+    )
+    .await
+    .unwrap();
+
+    let client_ephemeral_secret = StaticSecret::random();
+    let client_ephemeral_public = PublicKey::from(&client_ephemeral_secret);
+    ws.send(Message::Binary(
+        client_ephemeral_public.to_bytes().to_vec().into(),
+    ))
+    .await
+    .unwrap();
+
+    // Pins a DIFFERENT server key than the one actually configured — the
+    // scenario for a stale/wrong `server_key` action input, or a real
+    // man-in-the-middle at a TLS-terminating proxy answering in the real
+    // server's place.
+    let wrong_server_keygen = ServerKeygen::new();
+    let shared = client_ephemeral_secret.diffie_hellman(&server_public_key(&wrong_server_keygen));
+    let mut session_keys = SessionKeys::derive_for_client(&shared);
+
+    let confirm_msg = ws.next().await.unwrap().unwrap();
+    let Message::Binary(confirm_frame) = confirm_msg else {
+        panic!("expected a binary confirmation frame, got {confirm_msg:?}");
+    };
+    assert!(verify_confirmation_frame(&mut session_keys, &confirm_frame).is_err());
+}
+
+/// The full-stack proof: handshake, launch, and streamed output/exit code
+/// all correctly round-trip through the encryption layer — the encrypted
+/// counterpart to `happy_path_launches_streams_output_and_exit_code`.
+#[tokio::test]
+async fn encrypted_happy_path_launches_streams_output_and_exit_code() {
+    let port = 19122;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    let server_keygen = ServerKeygen::new();
+    let server_key_path = write_server_key(key_dir.path(), &server_keygen);
+    spawn_server(
+        config_with_encryption(port, &public_key_path, &server_key_path),
+        port,
+    )
+    .await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let (mut ws, mut security) =
+        connect_encrypted(port, "test-client", &client_key.key, &server_keygen).await;
+
+    send_launch_secured(&mut ws, &mut security, "hello", vec![], None).await;
+    match recv_launch_response_secured(&mut ws, &mut security).await {
+        TaskLaunchStatusResponseEnvelope::Success {
+            body: TaskLaunchStatus::Launched { .. },
+        } => {}
+        other => panic!("expected Launched, got {other:?}"),
+    }
+
+    let mut saw_output = false;
+    loop {
+        match recv_task_event_secured(&mut ws, &mut security).await {
+            Some(TaskEventResponseEnvelope::Success {
+                body: ServerTaskNotification::Output(event),
+            }) => {
+                assert_eq!(
+                    event.value,
+                    orosu::tasks::TaskOutput::Stdout("hi".to_string())
+                );
+                saw_output = true;
+            }
+            Some(TaskEventResponseEnvelope::Success {
+                body: ServerTaskNotification::ExitCode(code),
+            }) => {
+                assert_eq!(code, 0);
+                break;
+            }
+            Some(other) => panic!("unexpected event: {other:?}"),
+            None => panic!("connection closed before an exit code arrived"),
+        }
+    }
+    assert!(saw_output, "expected at least one stdout event");
 }
 
 #[tokio::test]

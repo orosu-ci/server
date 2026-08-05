@@ -9,6 +9,15 @@ listen:
 
 # log_level: "debug" # Valid values are: debug, info, warn, error. Default is info
 
+# End-to-end encryption (optional). Once set, this server also accepts
+# clients speaking protocol version 2 (in addition to 0 and 1) and performs
+# an authenticated handshake + ChaCha20-Poly1305 layer underneath the
+# existing wire protocol, so script arguments/attachments/output are no
+# longer plaintext at a TLS-terminating reverse proxy.
+# Generate with: orosu-keygen --kind server --private-key-output secrets/server.key --public-key-output secrets/server.pub
+# Give the PUBLIC key (server.pub's contents) to CI as the action's server_key input — never the private key.
+# encryption_key_file: "secrets/server.key"
+
 # Global IP whitelisting (optional)
 # Remove this section if you don't need global IP restrictions
 # A list of IPs that are allowed to connect to the service

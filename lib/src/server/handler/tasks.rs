@@ -2,14 +2,16 @@ use crate::api::envelopes::{
     RequestEnvelope, TaskEventResponseEnvelope, TaskLaunchStatusResponseEnvelope,
 };
 use crate::api::file_chunk::FileChunk;
+use crate::api::handshake::ConnectionSecurity;
 use crate::api::{ServerErrorResponse, ServerTaskNotification, StartTaskRequest, TaskLaunchStatus};
 use crate::client::Client;
-use crate::server::AuthContext;
 use crate::server::handler::TasksHandler;
+use crate::server::handshake::establish_security;
+use crate::server::{AuthContext, ServerState};
 use crate::tasks::TaskLaunchResult;
 use crate::tasks::task::Task;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, FromRequestParts, Request, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, FromRequestParts, Request, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum_client_ip::ClientIp;
@@ -17,20 +19,41 @@ use futures_util::{SinkExt, StreamExt};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::time::timeout;
 use zip::ZipArchive;
 
+/// The only place outgoing envelope bytes get sealed. Failure is only
+/// reachable if this connection's per-direction nonce counter has been
+/// exhausted (u64::MAX messages on one connection, not reachable in
+/// practice) — rather than ever falling back to sending the envelope
+/// unsealed, this logs and returns an empty frame, which fails to decrypt
+/// on the client's side exactly like any other transport error would.
+fn seal_or_log(security: &mut ConnectionSecurity, envelope: impl Into<bytes::Bytes>) -> Vec<u8> {
+    match security.seal(&envelope.into()) {
+        Ok(sealed) => sealed,
+        Err(e) => {
+            tracing::error!("Failed to seal outgoing message: {e}");
+            Vec::new()
+        }
+    }
+}
+
 impl TasksHandler {
     pub async fn attach(
         ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+        State(state): State<Arc<ServerState>>,
         auth_context: AuthContext,
         ws: WebSocketUpgrade,
         request: Request,
     ) -> impl IntoResponse {
-        let client = match auth_context {
-            AuthContext::Worker(worker_auth_context) => worker_auth_context.client,
+        let (client, protocol_version) = match auth_context {
+            AuthContext::Worker(worker_auth_context) => (
+                worker_auth_context.client,
+                worker_auth_context.protocol_version,
+            ),
         };
 
         let (mut parts, _) = request.into_parts();
@@ -54,11 +77,31 @@ impl TasksHandler {
             return StatusCode::FORBIDDEN.into_response();
         }
 
-        ws.on_upgrade(move |socket| handle_task_run_output(socket, client))
+        ws.on_upgrade(move |socket| handle_task_run_output(socket, client, protocol_version, state))
     }
 }
 
-async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
+async fn handle_task_run_output(
+    mut socket: WebSocket,
+    client: Client,
+    protocol_version: u32,
+    state: Arc<ServerState>,
+) {
+    let mut security = match establish_security(
+        &mut socket,
+        protocol_version,
+        state.encryption_key.as_ref(),
+    )
+    .await
+    {
+        Ok(security) => security,
+        Err(e) => {
+            tracing::error!("Encryption handshake failed: {e}");
+            _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
     let Some(task_message_result) = socket.recv().await else {
         tracing::info!("Client disconnected");
         _ = socket.send(Message::Close(None)).await;
@@ -72,6 +115,12 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
 
     let Message::Binary(start_task_message) = task_message else {
         tracing::error!("Cannot deserialize task message");
+        _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+
+    let Ok(start_task_message) = security.open(&start_task_message) else {
+        tracing::error!("Cannot decrypt task message");
         _ = socket.send(Message::Close(None)).await;
         return;
     };
@@ -99,7 +148,8 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
         let error_message = TaskLaunchStatusResponseEnvelope::Failure {
             error: ServerErrorResponse::ScriptNotFound,
         };
-        _ = sender.send(Message::Binary(error_message.into())).await;
+        let sealed = seal_or_log(&mut security, error_message);
+        _ = sender.send(Message::Binary(sealed.into())).await;
         _ = sender.send(Message::Close(None)).await;
         return;
     };
@@ -116,7 +166,8 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
                 let chunk_message = TaskLaunchStatusResponseEnvelope::Success {
                     body: TaskLaunchStatus::AwaitingFiles { offset },
                 };
-                _ = sender.send(Message::Binary(chunk_message.into())).await;
+                let sealed = seal_or_log(&mut security, chunk_message);
+                _ = sender.send(Message::Binary(sealed.into())).await;
                 let Some(response) = receiver.next().await else {
                     tracing::error!("Client disconnected during file transfer");
                     _ = sender.send(Message::Close(None)).await;
@@ -129,6 +180,11 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
                 };
                 let Message::Binary(chunk) = response else {
                     tracing::error!("Cannot deserialize file chunk message");
+                    _ = sender.send(Message::Close(None)).await;
+                    return;
+                };
+                let Ok(chunk) = security.open(&chunk) else {
+                    tracing::error!("Cannot decrypt file chunk message");
                     _ = sender.send(Message::Close(None)).await;
                     return;
                 };
@@ -160,7 +216,8 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
                 let error_message = TaskLaunchStatusResponseEnvelope::Failure {
                     error: ServerErrorResponse::CannotLaunchScript,
                 };
-                _ = sender.send(Message::Binary(error_message.into())).await;
+                let sealed = seal_or_log(&mut security, error_message);
+                _ = sender.send(Message::Binary(sealed.into())).await;
                 _ = sender.send(Message::Close(None)).await;
                 return;
             }
@@ -216,7 +273,8 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
             let error_message = TaskLaunchStatusResponseEnvelope::Failure {
                 error: ServerErrorResponse::CannotLaunchScript,
             };
-            _ = sender.send(Message::Binary(error_message.into())).await;
+            let sealed = seal_or_log(&mut security, error_message);
+            _ = sender.send(Message::Binary(sealed.into())).await;
             _ = sender.send(Message::Close(None)).await;
             return;
         }
@@ -227,7 +285,8 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
             started_on: created_on,
         },
     };
-    _ = sender.send(Message::Binary(created_message.into())).await;
+    let sealed = seal_or_log(&mut security, created_message);
+    _ = sender.send(Message::Binary(sealed.into())).await;
 
     tracing::info!("Starting task for script {}", script_name);
 
@@ -243,7 +302,8 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
                         let message = TaskEventResponseEnvelope::Success {
                             body: ServerTaskNotification::Output(event),
                         };
-                        if let Err(e) = sender.send(Message::Binary(message.into())).await {
+                        let sealed = seal_or_log(&mut security, message);
+                        if let Err(e) = sender.send(Message::Binary(sealed.into())).await {
                             tracing::error!("Cannot send real-time event: {:?}", e);
                             break None;
                         };
@@ -268,7 +328,8 @@ async fn handle_task_run_output(mut socket: WebSocket, client: Client) {
     let message = TaskEventResponseEnvelope::Success {
         body: ServerTaskNotification::ExitCode(exit_code),
     };
-    if let Err(e) = sender.send(Message::Binary(message.into())).await {
+    let sealed = seal_or_log(&mut security, message);
+    if let Err(e) = sender.send(Message::Binary(sealed.into())).await {
         tracing::error!("Cannot send exit-code event: {:?}", e);
     };
 

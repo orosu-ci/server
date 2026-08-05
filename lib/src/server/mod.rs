@@ -1,5 +1,6 @@
 use crate::client::Client;
 use crate::configuration::ListenConfiguration;
+use crate::cryptography::ServerStaticKey;
 use crate::server::handler::TasksHandler;
 use anyhow::Context;
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
@@ -16,9 +17,16 @@ use tower_http::trace::TraceLayer;
 
 mod auth_scope;
 mod handler;
+pub mod handshake;
 
 pub struct ServerState {
     clients: Vec<Client>,
+    /// The server's own static X25519 identity key, present only once an
+    /// operator has opted into end-to-end encryption (see
+    /// Configuration.encryption_key_file). Its presence is what
+    /// `supported_protocol_versions` gates protocol version 2 on — see
+    /// auth_scope.rs.
+    encryption_key: Option<ServerStaticKey>,
 }
 
 pub struct Server {
@@ -36,6 +44,11 @@ pub enum AuthScope {
 #[derive(Clone, Debug)]
 pub struct WorkerAuthContext {
     pub client: Client,
+    /// The protocol version this connection authenticated with (already
+    /// validated against `supported_protocol_versions` by the time this is
+    /// populated) — threaded through to the WS handler so it knows whether
+    /// to run the encryption handshake.
+    pub protocol_version: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -49,8 +62,12 @@ impl Server {
         whitelist: Option<Vec<IpCidr>>,
         blacklist: Option<Vec<IpCidr>>,
         clients: Vec<Client>,
+        encryption_key: Option<ServerStaticKey>,
     ) -> Self {
-        let state = Arc::new(ServerState { clients });
+        let state = Arc::new(ServerState {
+            clients,
+            encryption_key,
+        });
         Self {
             listen,
             state,
