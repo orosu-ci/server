@@ -33,6 +33,10 @@ Orosu provides a controlled execution boundary between CI and production:
 
 **No direct SSH. No credential juggling. No pipeline-specific hacks.**
 
+Optionally, an end-to-end encryption handshake (X25519 + ChaCha20-Poly1305) can be layered underneath
+the connection so script arguments, uploaded files, and streamed output stay confidential even if TLS is
+terminated at a reverse proxy in front of `orosu-server` — see step 5 of Quick Start below.
+
 ---
 
 ## Quick Start
@@ -127,7 +131,31 @@ clients:
           - "/etc/orosu/scripts/test.sh"
 ```
 
-### 5. Test run
+### 5. Enable end-to-end encryption (optional)
+By default, `orosu-server` relies entirely on WSS/TLS for transport security — and per step 3 above, that
+TLS is typically terminated at a reverse proxy in front of the server. That means script arguments,
+uploaded files, and streamed output are plaintext at that proxy, not truly end-to-end between CI and
+`orosu-server` itself.
+
+Generate a server encryption key:
+```bash
+cd /etc/orosu
+orosu-keygen --kind server --private-key-output server.key --public-key-output server.pub
+```
+
+Add it to the server config:
+```yaml
+encryption_key_file: /etc/orosu/server.key
+```
+
+Restart `orosu-server`, then give `server.pub`'s contents (public, not a secret) to CI as the action's
+`server_key` input — see step 6 below.
+
+This is opt-in and additive on both ends independently: a server with `encryption_key_file` configured
+still serves any client that omits `server_key` exactly as before, and setting `server_key` client-side
+only works once the server has opted in. No coordinated upgrade is required.
+
+### 6. Test run
 Open the secrets of your repository and add the private key file as a secret named `OROSU_CLIENT_KEY` and your server address as `OROSU_SERVER_URL`.
 Next you need to go to your CI pipeline and add a step to trigger the job.
 ```yaml
@@ -141,3 +169,16 @@ Next you need to go to your CI pipeline and add a step to trigger the job.
 ```
 
 As soon as you will trigger the job, the server will execute the script and print `Hello, from CI pipeline!` to the log.
+
+If you enabled end-to-end encryption in step 5, add `server.pub`'s contents as another secret (e.g.
+`OROSU_SERVER_KEY`) and pass it as `server_key`:
+```yaml
+- name: Remotely execute a script
+  uses: orosu-ci/orosu@v0
+  with:
+    address: ${{ secrets.OROSU_SERVER_URL }}
+    script: test-script
+    key: ${{ secrets.OROSU_CLIENT_KEY }}
+    server_key: ${{ secrets.OROSU_SERVER_KEY }}
+    arguments: "from CI pipeline"
+```
