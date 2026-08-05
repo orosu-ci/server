@@ -1,4 +1,4 @@
-use crate::api::protocol_version::{PROTOCOL_VERSION_HEADER_NAME, SUPPORTED_PROTOCOL_VERSIONS};
+use crate::api::protocol_version::{PROTOCOL_VERSION_HEADER_NAME, supported_protocol_versions};
 use crate::api::{ProtocolVersionHeader, UserAgentHeader};
 use crate::cryptography::Claims;
 use crate::server::{AuthContext, AuthScope, ServerState, WorkerAuthContext};
@@ -75,13 +75,15 @@ impl FromRequestParts<Arc<ServerState>> for AuthContext {
 
         // Accepts a *set* of versions, not just the current one, so that
         // clients built against the previous version keep working while a
-        // rollout is in progress — see SUPPORTED_PROTOCOL_VERSIONS's doc
-        // comment for why version 0 specifically can't be dropped yet.
-        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&client_protocol_version) {
+        // rollout is in progress — see supported_protocol_versions's doc
+        // comment for why version 0 specifically can't be dropped yet, and
+        // why version 2 is conditional on state.encryption_key.
+        let supported_versions = supported_protocol_versions(state.encryption_key.is_some());
+        if !supported_versions.contains(&client_protocol_version) {
             tracing::error!(
                 "Client protocol version {} is not supported by this server (supported: {:?})",
                 client_protocol_version,
-                SUPPORTED_PROTOCOL_VERSIONS
+                supported_versions
             );
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -166,6 +168,7 @@ impl FromRequestParts<Arc<ServerState>> for AuthContext {
 
                 Ok(AuthContext::Worker(WorkerAuthContext {
                     client: client.clone(),
+                    protocol_version: client_protocol_version,
                 }))
             }
         }

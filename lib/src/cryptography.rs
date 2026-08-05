@@ -83,6 +83,74 @@ impl Keygen {
     }
 }
 
+/// Generates the server's own static X25519 identity key, used to
+/// authenticate `orosu-server` to clients during the protocol-v2
+/// encryption handshake (see api/handshake.rs). Unlike `Keygen`'s
+/// `ClientKey`, there's no name to attach — this is one identity per
+/// server, not per client — so both halves are plain base64 of the raw 32
+/// bytes, matching how `Client.secret_file` is already read in
+/// server/auth_scope.rs, rather than the JSON-wrapped `ClientKey` shape.
+pub struct ServerKeygen {
+    public_key: [u8; 32],
+    private_key: [u8; 32],
+}
+
+impl ServerKeygen {
+    pub fn new() -> Self {
+        let secret = x25519_dalek::StaticSecret::random();
+        let public_key = x25519_dalek::PublicKey::from(&secret);
+        Self {
+            public_key: public_key.to_bytes(),
+            private_key: secret.to_bytes(),
+        }
+    }
+
+    pub fn public_key_base64(&self) -> String {
+        STANDARD.encode(self.public_key)
+    }
+
+    pub fn private_key_base64(&self) -> String {
+        STANDARD.encode(self.private_key)
+    }
+}
+
+impl Default for ServerKeygen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The server's own static X25519 private key, loaded from
+/// `Configuration.encryption_key_file`. Unlike `Client.secret_file` (a
+/// client's public key, re-read from disk on every auth attempt so
+/// revocation takes effect without a restart), this is loaded once at
+/// startup: rotating the server's own identity inherently requires a
+/// restart and coordinated re-pinning on every client anyway, so
+/// per-connection re-reading would add overhead with no matching benefit.
+pub struct ServerStaticKey(x25519_dalek::StaticSecret);
+
+impl ServerStaticKey {
+    pub fn from_base64(value: &str) -> anyhow::Result<Self> {
+        let bytes = STANDARD
+            .decode(value.trim())
+            .context("invalid server encryption key: not valid base64")?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid server encryption key: expected 32 bytes"))?;
+        Ok(Self(x25519_dalek::StaticSecret::from(bytes)))
+    }
+
+    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read encryption key file {}", path.display()))?;
+        Self::from_base64(&contents)
+    }
+
+    pub(crate) fn as_static_secret(&self) -> &x25519_dalek::StaticSecret {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +243,92 @@ mod tests {
         let message: &[u8] = b"test message";
         let signature = signing_key.sign(message);
         assert!(verifying_key.verify(message, &signature).is_ok());
+    }
+
+    // Confirms ServerKeygen produces a genuine X25519 keypair: a peer using
+    // the public key must derive the same shared secret as the server does
+    // using the corresponding private key.
+    #[test]
+    fn server_keygen_produces_a_valid_x25519_keypair() {
+        let server = ServerKeygen::new();
+        let server_static_key = ServerStaticKey::from_base64(&server.private_key_base64()).unwrap();
+
+        let peer_secret = x25519_dalek::StaticSecret::random();
+        let peer_public = x25519_dalek::PublicKey::from(&peer_secret);
+
+        let peer_public_bytes = STANDARD.decode(server.public_key_base64()).unwrap();
+        let server_public: x25519_dalek::PublicKey =
+            <[u8; 32]>::try_from(peer_public_bytes.as_slice())
+                .unwrap()
+                .into();
+
+        let from_peer = peer_secret.diffie_hellman(&server_public);
+        let from_server = server_static_key
+            .as_static_secret()
+            .diffie_hellman(&peer_public);
+        assert_eq!(from_peer.as_bytes(), from_server.as_bytes());
+    }
+
+    // Unlike ClientKey, a server encryption key has no client_name — it's
+    // plain base64 of the raw 32 bytes, matching how Client.secret_file is
+    // already read in server/auth_scope.rs.
+    #[test]
+    fn server_keygen_keys_are_plain_base64_of_32_raw_bytes_not_json() {
+        let server = ServerKeygen::new();
+
+        let public_bytes = STANDARD.decode(server.public_key_base64()).unwrap();
+        assert_eq!(public_bytes.len(), 32);
+
+        let private_bytes = STANDARD.decode(server.private_key_base64()).unwrap();
+        assert_eq!(private_bytes.len(), 32);
+    }
+
+    #[test]
+    fn server_static_key_from_base64_roundtrips_with_server_keygen_output() {
+        let server = ServerKeygen::new();
+        let key = ServerStaticKey::from_base64(&server.private_key_base64()).unwrap();
+
+        let public_bytes = STANDARD.decode(server.public_key_base64()).unwrap();
+        let expected_public: x25519_dalek::PublicKey =
+            <[u8; 32]>::try_from(public_bytes.as_slice())
+                .unwrap()
+                .into();
+
+        let derived_public = x25519_dalek::PublicKey::from(key.as_static_secret());
+        assert_eq!(derived_public.as_bytes(), expected_public.as_bytes());
+    }
+
+    #[test]
+    fn server_static_key_from_base64_rejects_invalid_base64() {
+        assert!(ServerStaticKey::from_base64("not valid base64 !!!").is_err());
+    }
+
+    #[test]
+    fn server_static_key_from_base64_rejects_wrong_length() {
+        let too_short = STANDARD.encode([1u8; 16]);
+        assert!(ServerStaticKey::from_base64(&too_short).is_err());
+    }
+
+    #[test]
+    fn server_static_key_from_file_reads_and_trims_whitespace() {
+        let server = ServerKeygen::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.key");
+        std::fs::write(&path, format!("{}\n", server.private_key_base64())).unwrap();
+
+        let key = ServerStaticKey::from_file(&path).unwrap();
+        let derived_public = x25519_dalek::PublicKey::from(key.as_static_secret());
+
+        let public_bytes = STANDARD.decode(server.public_key_base64()).unwrap();
+        assert_eq!(
+            derived_public.as_bytes().as_slice(),
+            public_bytes.as_slice()
+        );
+    }
+
+    #[test]
+    fn server_static_key_from_file_errors_on_missing_file() {
+        let result = ServerStaticKey::from_file(std::path::Path::new("/nonexistent/server.key"));
+        assert!(result.is_err());
     }
 }

@@ -4,7 +4,7 @@ use axum::http::HeaderValue;
 /// The current wire-protocol version. Bump this whenever the
 /// envelope/handshake contract changes in a way that breaks compatibility
 /// with a client built against the previous value — and add the new value
-/// to `SUPPORTED_PROTOCOL_VERSIONS` below so the server can keep accepting
+/// to `supported_protocol_versions` below so the server can keep accepting
 /// the version it's replacing.
 ///
 /// Version 0 is implicit, not a value anything ever sends on purpose: every
@@ -13,16 +13,35 @@ use axum::http::HeaderValue;
 /// as version 0 rather than a malformed request — see auth_scope.rs.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Protocol version 2: adds the end-to-end encryption handshake (see
+/// api/handshake.rs) underneath the existing envelope layer. A client
+/// speaking this version performs the handshake before sending
+/// `StartTaskRequest`; a client speaking 0 or 1 behaves exactly as before.
+pub const PROTOCOL_VERSION_ENCRYPTED_V2: u32 = 2;
+
 /// Every protocol version this server will currently accept a client
-/// speaking — not just the current `PROTOCOL_VERSION`. Version 0 has to
-/// stay listed until every currently-deployed client (including, as of
-/// introducing this header, every already-published `orosu-client` binary —
-/// a Rust CLI since discontinued in favor of the JS action — and every JS
-/// action release that predates this header) has actually been upgraded;
-/// dropping it here would reject that live traffic outright rather than let
-/// it interoperate during the rollout. See server/auth_scope.rs for the
-/// check that uses this.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[0, PROTOCOL_VERSION];
+/// speaking. Version 0 has to stay listed until every currently-deployed
+/// client (including, as of introducing the version header, every
+/// already-published `orosu-client` binary — a Rust CLI since discontinued
+/// in favor of the JS action — and every JS action release that predates
+/// that header) has actually been upgraded; dropping it here would reject
+/// that live traffic outright rather than let it interoperate during the
+/// rollout. See server/auth_scope.rs for the check that uses this.
+///
+/// Deliberately a function, not a const: whether version 2 is accepted
+/// depends on whether this server instance has an encryption key configured
+/// (`Configuration.encryption_key_file`). This is the entire backward
+/// compatibility story for the encryption feature — an orosu-server binary
+/// upgrade with an existing, unmodified config.yaml calls this with `false`
+/// and gets today's exact `[0, 1]`, so nothing changes for a deployment
+/// that hasn't opted in.
+pub fn supported_protocol_versions(encryption_configured: bool) -> Vec<u32> {
+    if encryption_configured {
+        vec![0, PROTOCOL_VERSION, PROTOCOL_VERSION_ENCRYPTED_V2]
+    } else {
+        vec![0, PROTOCOL_VERSION]
+    }
+}
 
 /// Shared by both the sending (api/client.rs) and receiving
 /// (server/auth_scope.rs) sides, so they can't drift on the literal string.
@@ -65,9 +84,22 @@ mod tests {
     }
 
     #[test]
-    fn supported_protocol_versions_includes_both_the_legacy_implicit_version_and_the_current_one() {
-        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&0));
-        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION));
+    fn supported_protocol_versions_without_encryption_matches_todays_set_exactly() {
+        // Backward compatibility on the server binary: an orosu-server
+        // upgrade with no encryption_key_file configured must not change
+        // what versions it accepts at all.
+        assert_eq!(
+            supported_protocol_versions(false),
+            vec![0, PROTOCOL_VERSION]
+        );
+    }
+
+    #[test]
+    fn supported_protocol_versions_with_encryption_additionally_includes_the_encrypted_version() {
+        let versions = supported_protocol_versions(true);
+        assert!(versions.contains(&0));
+        assert!(versions.contains(&PROTOCOL_VERSION));
+        assert!(versions.contains(&PROTOCOL_VERSION_ENCRYPTED_V2));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod envelopes;
 pub mod file_chunk;
+pub mod handshake;
 pub mod protocol_version;
 mod user_agent_header;
 

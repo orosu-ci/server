@@ -4,6 +4,7 @@ use crate::arguments::CliArguments;
 use anyhow::Context;
 use clap::Parser;
 use orosu::configuration::Configuration;
+use orosu::cryptography::ServerStaticKey;
 use orosu::server;
 use server::Server;
 use tracing::level_filters::LevelFilter;
@@ -24,11 +25,19 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::debug!("Starting Orosu server");
 
+    let encryption_key = configuration
+        .encryption_key_file
+        .as_ref()
+        .map(|path| ServerStaticKey::from_file(path))
+        .transpose()
+        .context("unable to load encryption key file")?;
+
     let server = Server::new(
         configuration.listen,
         configuration.ip_whitelist,
         configuration.ip_blacklist,
         configuration.clients,
+        encryption_key,
     );
 
     server.serve().await?;

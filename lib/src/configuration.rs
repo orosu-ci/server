@@ -50,6 +50,14 @@ pub struct Configuration {
     pub ip_blacklist: Option<Vec<IpCidr>>,
     #[serde(rename = "clients")]
     pub clients: Vec<Client>,
+    /// Path to the server's own static X25519 private key (see
+    /// cryptography::ServerStaticKey), generated with
+    /// `orosu-keygen --kind server`. Optional and absent by default: this
+    /// server only ever accepts protocol version 2 (the end-to-end
+    /// encryption handshake) once this is configured — see
+    /// api::protocol_version::supported_protocol_versions.
+    #[serde(rename = "encryption_key_file", default)]
+    pub encryption_key_file: Option<PathBuf>,
 }
 
 impl Configuration {
@@ -180,6 +188,36 @@ clients:
                 IpCidr::new(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 0)), 24).unwrap()
             ])
         );
+    }
+
+    #[test]
+    fn encryption_key_file_parses_when_present() {
+        let contents = r#"
+listen:
+  tcp: "0.0.0.0:8081"
+encryption_key_file: "secrets/server.key"
+clients: []
+"#;
+        let configuration: Configuration = serde_saphyr::from_str(contents).unwrap();
+        assert_eq!(
+            configuration.encryption_key_file,
+            Some(PathBuf::from("secrets/server.key"))
+        );
+    }
+
+    // This is the config-side half of the backward-compatibility story: an
+    // orosu-server upgrade with an existing config.yaml that predates this
+    // field must parse it as absent, not fail or silently enable
+    // encryption.
+    #[test]
+    fn encryption_key_file_defaults_to_none_when_absent() {
+        let contents = r#"
+listen:
+  tcp: "0.0.0.0:8081"
+clients: []
+"#;
+        let configuration: Configuration = serde_saphyr::from_str(contents).unwrap();
+        assert_eq!(configuration.encryption_key_file, None);
     }
 
     #[test]
