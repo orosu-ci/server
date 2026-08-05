@@ -134,6 +134,17 @@ jobs:
         with:
           address: ${{ secrets.OROSU_HOST }}
           key: ${{ secrets.OROSU_SECRET }}
+          # Server's static X25519 public key (see cryptography/protocol
+          # v2 in lib/src/api/handshake.rs) — not a secret in the
+          # confidentiality sense, but kept alongside OROSU_SECRET since
+          # that's this repo's existing convention for orosu connection
+          # config. orosu-ci/orosu@v0 currently still resolves to the old,
+          # pre-JS-rewrite composite action (see the `arguments` note
+          # below), which doesn't know this input at all — it's silently
+          # ignored until v0 moves to a release that has it. Once that
+          # happens this starts actually encrypting the connection with no
+          # further change needed here.
+          server_key: ${{ secrets.OROSU_SERVER_KEY }}
           script: deploy-deb-to-repo
           chunk_size: 131072
           # orosu-ci/orosu@v0 currently still resolves to the old, pre-JS-
@@ -162,4 +173,5 @@ jobs:
         with:
           address: ${{ secrets.OROSU_HOST }}
           key: ${{ secrets.OROSU_SECRET }}
+          server_key: ${{ secrets.OROSU_SERVER_KEY }}
           script: self-restart
