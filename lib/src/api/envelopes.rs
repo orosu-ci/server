@@ -118,12 +118,17 @@ mod tests {
     }
 
     // Documents current, deliberate behavior: these Bytes<->Envelope
-    // conversions are used client-side (api/client.rs) to trust server
-    // responses, and panic on malformed input rather than returning an
-    // error. The server instead hand-parses untrusted client bytes with
-    // graceful Ok/Err handling (server/handler/tasks.rs), never going
-    // through this conversion for anything client-supplied. If that ever
-    // changes, this test should fail and prompt reconsidering the choice.
+    // conversions panic on malformed input rather than returning an error.
+    // That's safe today because nothing in this crate calls them on
+    // untrusted, network-received bytes — the live WS client is
+    // client/src/*.js (a separate codebase), and the server instead
+    // hand-parses untrusted client bytes with graceful Ok/Err handling
+    // (server/handler/tasks.rs), never going through this conversion for
+    // anything client-supplied. (An earlier Rust CLI client did call these
+    // client-side to trust server responses; it's since been discontinued
+    // in favor of the JS action.) If a future Rust caller ever feeds
+    // network-received bytes through this conversion, this test should
+    // fail and prompt reconsidering the choice.
     #[test]
     #[should_panic]
     fn malformed_bytes_panics_rather_than_returning_an_error() {
