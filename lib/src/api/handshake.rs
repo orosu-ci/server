@@ -121,27 +121,52 @@ pub struct SessionKeys {
     recv: DirectionalCipher,
 }
 
+/// Rejects a non-contributory shared secret (the peer supplied a low-order
+/// public key, e.g. all-zero, to force a fixed, publicly-known shared
+/// secret — see `SharedSecret::was_contributory`'s docs) before it can ever
+/// reach key derivation. Called from both `derive_for_server` and
+/// `derive_for_client` rather than threading a role flag through one shared
+/// function — see the `SessionKeys` doc comment on why that distinction is
+/// kept out of this module's internals, not just its public API.
+fn require_contributory(shared_secret: &SharedSecret) -> anyhow::Result<()> {
+    if !shared_secret.was_contributory() {
+        anyhow::bail!(
+            "ECDH shared secret was non-contributory (peer supplied a low-order public key)"
+        );
+    }
+    Ok(())
+}
+
 impl SessionKeys {
     /// Derives session keys for the server's side of a connection: this
     /// party sends with the server-to-client key and receives with the
     /// client-to-server key.
-    pub fn derive_for_server(shared_secret: &SharedSecret) -> Self {
+    ///
+    /// Errors if `shared_secret` is non-contributory — see
+    /// `require_contributory`. This is the ADT enforcement of that check:
+    /// there is no way to obtain a `SessionKeys` from a bad shared secret,
+    /// so every call site is forced to handle the failure rather than one
+    /// being able to forget the check.
+    pub fn derive_for_server(shared_secret: &SharedSecret) -> anyhow::Result<Self> {
+        require_contributory(shared_secret)?;
         let (client_to_server, server_to_client) = derive_directional_keys(shared_secret);
-        Self {
+        Ok(Self {
             send: DirectionalCipher::new(server_to_client),
             recv: DirectionalCipher::new(client_to_server),
-        }
+        })
     }
 
     /// Derives session keys for the client's side of a connection: this
     /// party sends with the client-to-server key and receives with the
-    /// server-to-client key.
-    pub fn derive_for_client(shared_secret: &SharedSecret) -> Self {
+    /// server-to-client key. Same non-contributory check as
+    /// `derive_for_server` — see its docs.
+    pub fn derive_for_client(shared_secret: &SharedSecret) -> anyhow::Result<Self> {
+        require_contributory(shared_secret)?;
         let (client_to_server, server_to_client) = derive_directional_keys(shared_secret);
-        Self {
+        Ok(Self {
             send: DirectionalCipher::new(client_to_server),
             recv: DirectionalCipher::new(server_to_client),
-        }
+        })
     }
 }
 
@@ -224,8 +249,8 @@ mod tests {
         let client_shared = client_secret.diffie_hellman(&server_public);
 
         (
-            SessionKeys::derive_for_server(&server_shared),
-            SessionKeys::derive_for_client(&client_shared),
+            SessionKeys::derive_for_server(&server_shared).unwrap(),
+            SessionKeys::derive_for_client(&client_shared).unwrap(),
         )
     }
 
@@ -329,9 +354,32 @@ mod tests {
         let wrong_client_secret = StaticSecret::from([42u8; 32]);
         let wrong_server_public = PublicKey::from(&StaticSecret::from([1u8; 32]));
         let wrong_shared = wrong_client_secret.diffie_hellman(&wrong_server_public);
-        let mut wrong_client = SessionKeys::derive_for_client(&wrong_shared);
+        let mut wrong_client = SessionKeys::derive_for_client(&wrong_shared).unwrap();
 
         assert!(verify_confirmation_frame(&mut wrong_client, &frame).is_err());
+    }
+
+    // The all-zero point is a validly-encoded Curve25519 public key that
+    // forces the ECDH output to the identity element — a low-order-point
+    // attack (see `SharedSecret::was_contributory`'s docs) a MITM could use
+    // to make the shared secret a fixed, publicly-known value instead of
+    // one only the two real parties could compute.
+    fn non_contributory_shared_secret() -> SharedSecret {
+        let secret = StaticSecret::from([5u8; 32]);
+        let low_order_public = PublicKey::from([0u8; 32]);
+        secret.diffie_hellman(&low_order_public)
+    }
+
+    #[test]
+    fn derive_for_server_rejects_a_non_contributory_shared_secret() {
+        let shared = non_contributory_shared_secret();
+        assert!(SessionKeys::derive_for_server(&shared).is_err());
+    }
+
+    #[test]
+    fn derive_for_client_rejects_a_non_contributory_shared_secret() {
+        let shared = non_contributory_shared_secret();
+        assert!(SessionKeys::derive_for_client(&shared).is_err());
     }
 
     fn to_hex(bytes: &[u8]) -> String {
@@ -355,7 +403,7 @@ mod tests {
         let client_public = PublicKey::from(&client_secret);
 
         let shared = server_secret.diffie_hellman(&client_public);
-        let mut server_keys = SessionKeys::derive_for_server(&shared);
+        let mut server_keys = SessionKeys::derive_for_server(&shared).unwrap();
         let frame = build_confirmation_frame(&mut server_keys).unwrap();
 
         assert_eq!(to_hex(&frame), "3cefb8b6a2d28e0c1c96d8c5d7919cf9");

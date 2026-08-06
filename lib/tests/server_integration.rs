@@ -1236,7 +1236,7 @@ async fn connect_encrypted(
     .unwrap();
 
     let shared = client_ephemeral_secret.diffie_hellman(&server_public_key(server_keygen));
-    let mut session_keys = SessionKeys::derive_for_client(&shared);
+    let mut session_keys = SessionKeys::derive_for_client(&shared).unwrap();
 
     let confirm_msg = ws.next().await.unwrap().unwrap();
     let Message::Binary(confirm_frame) = confirm_msg else {
@@ -1356,7 +1356,7 @@ async fn encrypted_handshake_with_wrong_pinned_server_key_fails_confirmation() {
     // server's place.
     let wrong_server_keygen = ServerKeygen::new();
     let shared = client_ephemeral_secret.diffie_hellman(&server_public_key(&wrong_server_keygen));
-    let mut session_keys = SessionKeys::derive_for_client(&shared);
+    let mut session_keys = SessionKeys::derive_for_client(&shared).unwrap();
 
     let confirm_msg = ws.next().await.unwrap().unwrap();
     let Message::Binary(confirm_frame) = confirm_msg else {

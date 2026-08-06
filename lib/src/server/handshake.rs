@@ -57,7 +57,7 @@ pub async fn establish_security(
     let shared_secret = server_key
         .as_static_secret()
         .diffie_hellman(&client_ephemeral_public);
-    let mut session_keys = SessionKeys::derive_for_server(&shared_secret);
+    let mut session_keys = SessionKeys::derive_for_server(&shared_secret)?;
 
     let confirmation_frame = build_confirmation_frame(&mut session_keys)?;
     timeout(
