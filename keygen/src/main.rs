@@ -31,11 +31,20 @@ fn restrict_to_owner(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes `value` to `output` if given, otherwise prints it to `out`. When
+/// printing a secret (`WritePermissions::OwnerOnly`) with no output path,
+/// also warns on `err` first — the value still goes to stdout unchanged
+/// (so anything piping/capturing it keeps working), but the operator gets
+/// a visible heads-up that it's about to land in their terminal
+/// scrollback, a recorded session, or a CI log with no path given to
+/// avoid that.
 fn write_or_print(
     label: &str,
     value: String,
     output: Option<std::path::PathBuf>,
     permissions: WritePermissions,
+    out: &mut impl Write,
+    err: &mut impl Write,
 ) -> anyhow::Result<()> {
     match output {
         Some(path) => {
@@ -46,10 +55,18 @@ fn write_or_print(
             }
             #[cfg(not(unix))]
             let _ = permissions;
-            println!("{label} written to {}", path.display());
+            writeln!(out, "{label} written to {}", path.display())?;
         }
         None => {
-            println!("{label}: {value}");
+            if matches!(permissions, WritePermissions::OwnerOnly) {
+                writeln!(
+                    err,
+                    "warning: {label} is being printed to stdout instead of written to a file \
+                     — it may end up in your terminal scrollback, a recorded session, or CI \
+                     logs. Pass --private-key-output <file> to avoid this."
+                )?;
+            }
+            writeln!(out, "{label}: {value}")?;
         }
     };
     Ok(())
@@ -98,17 +115,24 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+
     write_or_print(
         "Private key",
         private_key,
         arguments.private_key_output,
         WritePermissions::OwnerOnly,
+        &mut stdout,
+        &mut stderr,
     )?;
     write_or_print(
         "Public key",
         public_key,
         arguments.public_key_output,
         WritePermissions::Default,
+        &mut stdout,
+        &mut stderr,
     )?;
 
     Ok(())
@@ -124,12 +148,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("private.key");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
 
         write_or_print(
             "Private key",
             "shh".to_string(),
             Some(path.clone()),
             WritePermissions::OwnerOnly,
+            &mut out,
+            &mut err,
         )
         .unwrap();
 
@@ -148,17 +176,90 @@ mod tests {
         // coincidentally landing on the same bits some other way.
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
 
         write_or_print(
             "Public key",
             "not-a-secret".to_string(),
             Some(path.clone()),
             WritePermissions::Default,
+            &mut out,
+            &mut err,
         )
         .unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o666);
+    }
+
+    fn as_utf8(buf: Vec<u8>) -> String {
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn printing_a_secret_to_stdout_warns_on_stderr_first() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        write_or_print(
+            "Private key",
+            "shh".to_string(),
+            None,
+            WritePermissions::OwnerOnly,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+
+        assert_eq!(as_utf8(out), "Private key: shh\n");
+        assert!(
+            as_utf8(err).contains("warning"),
+            "expected a warning on stderr when printing a secret to stdout"
+        );
+    }
+
+    // The public key isn't a secret — it's meant to be shared — so printing
+    // it to stdout shouldn't trigger the same warning.
+    #[test]
+    fn printing_a_non_secret_to_stdout_does_not_warn() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        write_or_print(
+            "Public key",
+            "not-a-secret".to_string(),
+            None,
+            WritePermissions::Default,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+
+        assert_eq!(as_utf8(out), "Public key: not-a-secret\n");
+        assert!(as_utf8(err).is_empty());
+    }
+
+    // Writing a secret to a file is exactly what the warning exists to
+    // steer operators toward — it must not also warn on that path.
+    #[test]
+    fn writing_a_secret_to_a_file_does_not_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.key");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        write_or_print(
+            "Private key",
+            "shh".to_string(),
+            Some(path),
+            WritePermissions::OwnerOnly,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+
+        assert!(as_utf8(err).is_empty());
     }
 
     fn args_with_outputs(private: &str, public: &str) -> CliArguments {
