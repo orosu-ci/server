@@ -373,6 +373,106 @@ clients:
     assert!(saw_output, "expected at least one stdout event");
 }
 
+/// A WS-level Ping arriving while the server is waiting for the launch
+/// message must be tolerated (skipped), not torn down as malformed input —
+/// a spec-compliant peer or intermediary (e.g. the documented nginx
+/// reverse-proxy path) can legitimately send one at any time.
+#[tokio::test]
+async fn a_ping_frame_before_the_launch_message_does_not_break_the_connection() {
+    let port = 19130;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+
+    let config = build_config(&format!(
+        r#"
+listen:
+  tcp: "127.0.0.1:{port}"
+clients:
+  - name: "test-client"
+    secret_file: "{}"
+    scripts:
+      - name: "hello"
+        command: ["echo", "hi"]
+"#,
+        public_key_path.display()
+    ));
+    spawn_server(config, port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    ws.send(Message::Ping(Bytes::from_static(b"keepalive")))
+        .await
+        .unwrap();
+    // axum auto-replies to a Ping with a Pong before ever reaching the
+    // handler that's waiting on the real launch message — consuming it
+    // here (rather than via `launch_without_file`'s `recv_launch_response`,
+    // which only expects a Binary frame) both confirms the low-level
+    // exchange happened normally and gets it out of the way.
+    match ws.next().await.unwrap().unwrap() {
+        Message::Pong(_) => {}
+        other => panic!("expected an auto-Pong reply, got {other:?}"),
+    }
+
+    launch_without_file(&mut ws, "hello", vec![]).await;
+}
+
+/// Same as above, but for a Ping arriving mid-upload — during the
+/// file-chunk loop, not the initial launch-message wait.
+#[tokio::test]
+async fn a_ping_frame_mid_upload_does_not_break_the_connection() {
+    let port = 19131;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(config_with_attachment_script(port, &public_key_path), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    let zip_bytes = build_zip(&[("test.txt", b"hello attachment")]);
+    let hash = md5::compute(&zip_bytes).0.to_vec();
+    let size = zip_bytes.len();
+
+    send_launch(
+        &mut ws,
+        "cat-file",
+        vec![],
+        Some(FileAttachment { hash, size }),
+    )
+    .await;
+    match recv_launch_response(&mut ws).await {
+        TaskLaunchStatusResponseEnvelope::Success {
+            body: TaskLaunchStatus::AwaitingFiles { offset },
+        } => assert_eq!(offset, 0),
+        other => panic!("expected AwaitingFiles, got {other:?}"),
+    }
+
+    ws.send(Message::Ping(Bytes::from_static(b"keepalive")))
+        .await
+        .unwrap();
+    match ws.next().await.unwrap().unwrap() {
+        Message::Pong(_) => {}
+        other => panic!("expected an auto-Pong reply, got {other:?}"),
+    }
+
+    let chunk = FileChunkRequestEnvelope {
+        body: FileChunk {
+            offset: 0,
+            data: zip_bytes,
+        },
+    };
+    ws.send(Message::Binary(chunk.into())).await.unwrap();
+
+    match recv_launch_response(&mut ws).await {
+        TaskLaunchStatusResponseEnvelope::Success {
+            body: TaskLaunchStatus::Launched { .. },
+        } => {}
+        other => panic!("expected Launched, got {other:?}"),
+    }
+}
+
 fn single_client_config(
     port: u16,
     public_key_path: &std::path::Path,
@@ -1581,6 +1681,39 @@ async fn a_client_that_never_sends_a_launch_message_is_disconnected_after_the_ti
     tokio::time::pause();
 
     // Deliberately never sends a StartTaskRequest.
+    match ws.next().await {
+        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+        Some(Ok(other)) => panic!("expected disconnection, got a message: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn keepalive_pings_do_not_extend_the_launch_message_timeout() {
+    let port = 19132;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(single_client_config(port, &public_key_path, ""), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    tokio::time::pause();
+
+    // A keepalive during the wait must not reset the server's timeout
+    // budget — `recv_skipping_keepalives` loops *inside* one `timeout(...)`
+    // call rather than re-wrapping each individual read, so this shouldn't
+    // buy any extra time before the deadline still fires.
+    ws.send(Message::Ping(Bytes::from_static(b"keepalive")))
+        .await
+        .unwrap();
+    match ws.next().await.unwrap().unwrap() {
+        Message::Pong(_) => {}
+        other => panic!("expected an auto-Pong reply, got {other:?}"),
+    }
+
+    // Still never sends a StartTaskRequest — the connection must still be
+    // torn down once the (unextended) timeout elapses.
     match ws.next().await {
         None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
         Some(Ok(other)) => panic!("expected disconnection, got a message: {other:?}"),
