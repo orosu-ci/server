@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{NamedTempFile, TempDir};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use zip::ZipArchive;
 
@@ -109,6 +110,23 @@ fn copy_bounded(
         }
         writer.write_all(&buf[..n])?;
     }
+}
+
+/// Drains every message currently sitting in `rx`'s buffer, without waiting
+/// for new ones. Only meaningful to call once every sender clone for this
+/// channel has already been dropped — otherwise this can return before a
+/// concurrent `send().await` has actually enqueued its message. See the
+/// call site: `tokio::select!` between `rx.recv()` and the task handle can,
+/// per its own documented non-deterministic tie-breaking when both are
+/// simultaneously ready, pick the handle branch and abandon the loop while
+/// output the task already finished sending is still sitting unconsumed in
+/// the channel — this recovers it instead of silently losing it.
+fn drain_buffered<T>(rx: &mut mpsc::Receiver<T>) -> Vec<T> {
+    let mut drained = Vec::new();
+    while let Ok(item) = rx.try_recv() {
+        drained.push(item);
+    }
+    drained
 }
 
 impl TasksHandler {
@@ -569,6 +587,23 @@ async fn handle_task_run_output(
         tracing::info!("Script {} was not awaited to be finished", script_name);
         return;
     };
+
+    // The handler task only reaches this point after joining its stdout and
+    // stderr readers, so every sender clone for `rx` has already been
+    // dropped — any events still sitting in the buffer here are real
+    // output the `select!` above raced past, not something still in
+    // flight.
+    for event in drain_buffered(&mut rx) {
+        tracing::info!("Task event (drained after exit): {:?}", event);
+        let message = TaskEventResponseEnvelope::Success {
+            body: ServerTaskNotification::Output(event),
+        };
+        let sealed = seal_or_log(&mut security, message);
+        if let Err(e) = sender.send(Message::Binary(sealed.into())).await {
+            tracing::error!("Cannot send drained event: {:?}", e);
+        };
+    }
+
     tracing::info!(
         "Script {} has finished with {} exit code",
         script_name,
@@ -661,5 +696,27 @@ mod tests {
         let result = copy_bounded(&mut second, &mut writer, &mut total, 10);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn drain_buffered_returns_everything_sitting_in_the_channel_in_order() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        tx.try_send(3).unwrap();
+        // The real call site only drains after every sender is dropped —
+        // dropping it here mirrors that and proves the loop terminates
+        // instead of waiting for a message that will never arrive.
+        drop(tx);
+
+        assert_eq!(drain_buffered(&mut rx), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn drain_buffered_returns_empty_when_nothing_is_buffered() {
+        let (tx, mut rx) = mpsc::channel::<i32>(8);
+        drop(tx);
+
+        assert_eq!(drain_buffered(&mut rx), Vec::<i32>::new());
     }
 }
