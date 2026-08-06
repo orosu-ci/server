@@ -65,7 +65,42 @@ impl Configuration {
         let file = std::fs::File::open(path)
             .with_context(|| format!("Failed to open configuration file at {}", path.display()))?;
         let reader = std::io::BufReader::new(file);
-        serde_saphyr::from_reader(reader).with_context(|| "Failed to parse configuration")
+        let configuration: Self =
+            serde_saphyr::from_reader(reader).with_context(|| "Failed to parse configuration")?;
+        configuration.validate()?;
+        Ok(configuration)
+    }
+
+    /// Rejects a config where two clients share a `name`, or where one
+    /// client's own scripts share a `name` with each other. Both
+    /// `auth_scope.rs`'s client lookup and `handler/tasks.rs`'s script
+    /// lookup use `.find()`, which silently resolves to the first match —
+    /// without this, a duplicate name would make the second entry
+    /// permanently unreachable with no warning at startup, looking like a
+    /// working config. The same script name under two *different* clients
+    /// is fine, since scripts are only ever looked up already scoped to one
+    /// authenticated client.
+    fn validate(&self) -> anyhow::Result<()> {
+        let mut seen_clients = std::collections::HashSet::new();
+        for client in &self.clients {
+            if !seen_clients.insert(client.name.as_str()) {
+                anyhow::bail!(
+                    "Duplicate client name in configuration: \"{}\"",
+                    client.name
+                );
+            }
+            let mut seen_scripts = std::collections::HashSet::new();
+            for script in &client.scripts {
+                if !seen_scripts.insert(script.name.as_str()) {
+                    anyhow::bail!(
+                        "Duplicate script name \"{}\" for client \"{}\"",
+                        script.name,
+                        client.name
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -295,5 +330,90 @@ clients: []
 
         let result = Configuration::from_file(&path);
         assert!(result.is_err());
+    }
+
+    // auth_scope.rs's client lookup and handler/tasks.rs's script lookup
+    // both use `.find()`, which silently resolves to the first match — a
+    // duplicate name would otherwise make the second entry permanently
+    // unreachable with no warning at startup, looking like a working
+    // config to an operator who copy-pasted a client block and forgot to
+    // rename it.
+    #[test]
+    fn from_file_rejects_a_config_with_duplicate_client_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+listen:
+  tcp: "127.0.0.1:9000"
+clients:
+  - name: "same-name"
+    secret_file: "a.key"
+    scripts: []
+  - name: "same-name"
+    secret_file: "b.key"
+    scripts: []
+"#,
+        )
+        .unwrap();
+
+        let result = Configuration::from_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_file_rejects_a_config_with_duplicate_script_names_for_the_same_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+listen:
+  tcp: "127.0.0.1:9000"
+clients:
+  - name: "test-client"
+    secret_file: "a.key"
+    scripts:
+      - name: "same-name"
+        command: ["echo", "one"]
+      - name: "same-name"
+        command: ["echo", "two"]
+"#,
+        )
+        .unwrap();
+
+        let result = Configuration::from_file(&path);
+        assert!(result.is_err());
+    }
+
+    // The same script name under two *different* clients is fine — scripts
+    // are only looked up scoped to the already-authenticated client, so
+    // there's no ambiguity for `.find()` to silently resolve wrong here.
+    #[test]
+    fn from_file_allows_the_same_script_name_across_different_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+listen:
+  tcp: "127.0.0.1:9000"
+clients:
+  - name: "client-a"
+    secret_file: "a.key"
+    scripts:
+      - name: "deploy"
+        command: ["echo", "a"]
+  - name: "client-b"
+    secret_file: "b.key"
+    scripts:
+      - name: "deploy"
+        command: ["echo", "b"]
+"#,
+        )
+        .unwrap();
+
+        assert!(Configuration::from_file(&path).is_ok());
     }
 }
