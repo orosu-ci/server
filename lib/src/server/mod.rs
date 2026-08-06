@@ -92,6 +92,18 @@ impl Server {
             }
 
             ListenConfiguration::Socket(path) => {
+                // A server that didn't shut down cleanly (crash, kill -9)
+                // leaves this file behind. UnixListener::bind refuses to
+                // bind over any existing path, so without this a restart
+                // would fail with "Address already in use" against a socket
+                // nothing is actually listening on anymore.
+                if let Err(err) = std::fs::remove_file(path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(err).with_context(|| {
+                        format!("Failed to remove stale unix socket path {}", path.display())
+                    });
+                }
                 let listener = tokio::net::UnixListener::bind(path).with_context(|| {
                     format!("Failed to bind to unix socket path {}", path.display())
                 })?;
@@ -119,8 +131,19 @@ impl Server {
     }
 }
 
+/// Unix domain socket peers have no IP address at all — `ConnectInfo<SocketAddr>`
+/// is only ever inserted for TCP connections (see `Server::serve`), so it's
+/// read directly out of the request extensions here rather than as a hard
+/// extractor argument, which would otherwise fail the request outright for
+/// every unix socket connection regardless of whether a list is configured.
+fn remote_ip(parts: &axum::http::request::Parts) -> Option<std::net::IpAddr> {
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+}
+
 async fn blacklist_layer(
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(blacklist): State<Option<Vec<IpCidr>>>,
     request: Request,
     next: Next,
@@ -129,10 +152,13 @@ async fn blacklist_layer(
         return next.run(request).await;
     };
     let (mut parts, body) = request.into_parts();
+    let Some(remote_addr) = remote_ip(&parts) else {
+        return next.run(Request::from_parts(parts, body)).await;
+    };
     let ip = ClientIp::from_request_parts(&mut parts, &())
         .await
         .map(|e| e.0)
-        .unwrap_or_else(|_| remote_addr.ip());
+        .unwrap_or(remote_addr);
     if blacklist.iter().any(|cidr| cidr.contains(&ip)) {
         tracing::warn!("Client {} is blacklisted", ip);
         return StatusCode::FORBIDDEN.into_response();
@@ -141,7 +167,6 @@ async fn blacklist_layer(
 }
 
 async fn whitelist_layer(
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(whitelist): State<Option<Vec<IpCidr>>>,
     request: Request,
     next: Next,
@@ -150,10 +175,13 @@ async fn whitelist_layer(
         return next.run(request).await;
     };
     let (mut parts, body) = request.into_parts();
+    let Some(remote_addr) = remote_ip(&parts) else {
+        return next.run(Request::from_parts(parts, body)).await;
+    };
     let ip = ClientIp::from_request_parts(&mut parts, &())
         .await
         .map(|e| e.0)
-        .unwrap_or_else(|_| remote_addr.ip());
+        .unwrap_or(remote_addr);
     if !whitelist.iter().any(|cidr| cidr.contains(&ip)) {
         tracing::warn!("Client {} is not whitelisted", ip);
         return StatusCode::FORBIDDEN.into_response();

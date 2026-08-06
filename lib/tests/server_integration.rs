@@ -30,11 +30,12 @@ use orosu::api::protocol_version::{
     PROTOCOL_VERSION, PROTOCOL_VERSION_ENCRYPTED_V2, PROTOCOL_VERSION_HEADER_NAME,
 };
 use orosu::api::{FileAttachment, ServerTaskNotification, StartTaskRequest, TaskLaunchStatus};
-use orosu::configuration::Configuration;
+use orosu::configuration::{Configuration, ListenConfiguration};
 use orosu::cryptography::{ClientKey, Keygen, ServerKeygen, ServerStaticKey};
 use orosu::server::Server;
 use std::io::Write;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
@@ -78,6 +79,42 @@ async fn spawn_server(configuration: Configuration, port: u16) {
         let _ = server.serve().await;
     });
     wait_for_port(port).await;
+}
+
+async fn wait_for_socket(path: &std::path::Path) {
+    for _ in 0..200 {
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("unix socket at {} never became reachable", path.display());
+}
+
+/// Same as `spawn_server`, but for a `listen: {socket: ...}` configuration —
+/// the socket path is read back out of the configuration rather than passed
+/// separately, since (unlike a TCP port) it isn't known ahead of the config
+/// existing.
+async fn spawn_server_unix(configuration: Configuration) {
+    let ListenConfiguration::Socket(socket_path) = &configuration.listen else {
+        panic!("spawn_server_unix requires a `socket` listen configuration");
+    };
+    let socket_path = socket_path.clone();
+    let encryption_key = configuration
+        .encryption_key_file
+        .as_ref()
+        .map(|path| ServerStaticKey::from_file(path).unwrap());
+    tokio::spawn(async move {
+        let server = Server::new(
+            configuration.listen,
+            configuration.ip_whitelist,
+            configuration.ip_blacklist,
+            configuration.clients,
+            encryption_key,
+        );
+        let _ = server.serve().await;
+    });
+    wait_for_socket(&socket_path).await;
 }
 
 fn write_public_key(dir: &std::path::Path, keygen: &Keygen) -> std::path::PathBuf {
@@ -181,6 +218,37 @@ async fn connect_authenticated(port: u16, client_name: &str, seed: &[u8]) -> WsS
     .unwrap()
 }
 
+type UnixWsStream = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
+
+/// The unix-socket equivalent of `connect_authenticated`. There's no host:port
+/// to dial, so this connects the `UnixStream` directly and hands it to
+/// `tokio_tungstenite::client_async` — the URL in the handshake request is
+/// only used to build the `Host` header and is otherwise irrelevant.
+async fn connect_authenticated_unix(
+    socket_path: &std::path::Path,
+    client_name: &str,
+    seed: &[u8],
+) -> UnixWsStream {
+    let token = sign_jwt(client_name, seed, 10);
+    let stream = tokio::net::UnixStream::connect(socket_path).await.unwrap();
+    let mut request = "ws://localhost/".into_client_request().unwrap();
+    let headers = request.headers_mut();
+    headers.remove("user-agent");
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Token {token}")).unwrap(),
+    );
+    headers.insert("user-agent", HeaderValue::from_static("Orosu/test-suite"));
+    headers.insert(
+        HeaderName::from_static(PROTOCOL_VERSION_HEADER_NAME),
+        HeaderValue::from_str(&PROTOCOL_VERSION.to_string()).unwrap(),
+    );
+    let (ws, _response) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .unwrap();
+    ws
+}
+
 fn rejection_status(err: &tokio_tungstenite::tungstenite::Error) -> Option<u16> {
     match err {
         tokio_tungstenite::tungstenite::Error::Http(response) => Some(response.status().as_u16()),
@@ -188,8 +256,8 @@ fn rejection_status(err: &tokio_tungstenite::tungstenite::Error) -> Option<u16> 
     }
 }
 
-async fn send_launch(
-    ws: &mut WsStream,
+async fn send_launch<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
     script: &str,
     args: Vec<String>,
     file: Option<FileAttachment>,
@@ -204,7 +272,9 @@ async fn send_launch(
     ws.send(Message::Binary(envelope.into())).await.unwrap();
 }
 
-async fn recv_launch_response(ws: &mut WsStream) -> TaskLaunchStatusResponseEnvelope {
+async fn recv_launch_response<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> TaskLaunchStatusResponseEnvelope {
     let msg = ws.next().await.unwrap().unwrap();
     let Message::Binary(bytes) = msg else {
         panic!("expected a binary message, got {msg:?}");
@@ -212,7 +282,9 @@ async fn recv_launch_response(ws: &mut WsStream) -> TaskLaunchStatusResponseEnve
     bytes.into()
 }
 
-async fn recv_task_event(ws: &mut WsStream) -> Option<TaskEventResponseEnvelope> {
+async fn recv_task_event<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> Option<TaskEventResponseEnvelope> {
     match ws.next().await {
         Some(Ok(Message::Binary(bytes))) => Some(bytes.into()),
         Some(Ok(Message::Close(_))) | None => None,
@@ -234,7 +306,11 @@ fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
 
 /// Runs the full launch handshake for a script with no file attachment,
 /// asserting it reaches `launched`.
-async fn launch_without_file(ws: &mut WsStream, script: &str, args: Vec<String>) {
+async fn launch_without_file<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    script: &str,
+    args: Vec<String>,
+) {
     send_launch(ws, script, args, None).await;
     let response = recv_launch_response(ws).await;
     match response {
@@ -1192,4 +1268,127 @@ async fn global_whitelist_allows_a_matching_ip_through_to_auth() {
     let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
     let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
     launch_without_file(&mut ws, "hello", vec![]).await;
+}
+
+// `listen: {socket: ...}` is a second, independent listener implementation
+// (server/mod.rs binds a UnixListener and hands the router to axum::serve
+// directly, rather than going through into_make_service_with_connect_info
+// like the TCP path does) — it needs its own coverage rather than relying on
+// the TCP tests above to stand in for it.
+
+#[tokio::test]
+async fn unix_socket_happy_path_launches_streams_output_and_exit_code() {
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("orosu.sock");
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+
+    let config = build_config(&format!(
+        r#"
+listen:
+  socket: "{}"
+clients:
+  - name: "test-client"
+    secret_file: "{}"
+    scripts:
+      - name: "hello"
+        command: ["echo", "hello from unix socket integration test"]
+"#,
+        socket_path.display(),
+        public_key_path.display()
+    ));
+    spawn_server_unix(config).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated_unix(&socket_path, "test-client", &client_key.key).await;
+
+    launch_without_file(&mut ws, "hello", vec![]).await;
+
+    let mut saw_output = false;
+    loop {
+        match recv_task_event(&mut ws).await {
+            Some(TaskEventResponseEnvelope::Success {
+                body: ServerTaskNotification::Output(event),
+            }) => {
+                assert_eq!(
+                    event.value,
+                    orosu::tasks::TaskOutput::Stdout(
+                        "hello from unix socket integration test".to_string()
+                    )
+                );
+                saw_output = true;
+            }
+            Some(TaskEventResponseEnvelope::Success {
+                body: ServerTaskNotification::ExitCode(code),
+            }) => {
+                assert_eq!(code, 0);
+                break;
+            }
+            Some(other) => panic!("unexpected event: {other:?}"),
+            None => panic!("connection closed before an exit code arrived"),
+        }
+    }
+    assert!(saw_output, "expected at least one stdout event");
+}
+
+// Unix domain socket peers have no IP address at all, so an IP allow/deny
+// list can't be meaningfully applied to them — the socket file's own
+// filesystem permissions are the access-control boundary instead. This
+// proves that configuring one doesn't crash (or silently reject) unix
+// socket connections; it should be a no-op for them.
+#[tokio::test]
+async fn unix_socket_connection_succeeds_even_when_a_global_whitelist_is_configured() {
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("orosu.sock");
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+
+    let config = build_config(&format!(
+        r#"
+listen:
+  socket: "{}"
+whitelisted_ips:
+  - "10.0.0.0/8"
+clients:
+  - name: "test-client"
+    secret_file: "{}"
+    scripts:
+      - name: "hello"
+        command: ["echo", "hi"]
+"#,
+        socket_path.display(),
+        public_key_path.display()
+    ));
+    spawn_server_unix(config).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated_unix(&socket_path, "test-client", &client_key.key).await;
+    launch_without_file(&mut ws, "hello", vec![]).await;
+}
+
+// A crashed (rather than cleanly-shutdown) server leaves its socket file
+// behind. `UnixListener::bind` refuses to bind over any existing path, so
+// without cleanup a restart would fail with "Address already in use" even
+// though nothing is actually listening there anymore.
+#[tokio::test]
+async fn rebinding_a_unix_socket_removes_a_stale_socket_file_from_a_previous_run() {
+    let socket_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("orosu.sock");
+    std::fs::write(&socket_path, b"").unwrap();
+
+    let config = build_config(&format!(
+        r#"
+listen:
+  socket: "{}"
+clients: []
+"#,
+        socket_path.display()
+    ));
+
+    // spawn_server_unix's wait_for_socket already proves the bind
+    // succeeded: connecting to a stale, non-socket file fails immediately,
+    // so a wedged bind would surface as this call timing out and panicking.
+    spawn_server_unix(config).await;
 }
