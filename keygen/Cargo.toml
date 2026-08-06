@@ -12,3 +12,6 @@ description = "CI task remote executor keygen"
 anyhow = "1.0.100"
 clap = "4.5.53"
 orosu = { path = '../lib' }
+
+[dev-dependencies]
+tempfile = "3.23.0"

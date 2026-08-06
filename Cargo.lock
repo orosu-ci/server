@@ -1474,6 +1474,7 @@ dependencies = [
  "anyhow",
  "clap",
  "orosu",
+ "tempfile",
 ]
 
 [[package]]
