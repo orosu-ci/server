@@ -7,6 +7,10 @@ A secure CI/CD delivery tool designed to replace ad-hoc SSH/SCP steps in GitHub 
 Instead of configuring SSH keys, users, file paths, and brittle deployment scripts in every pipeline, you install *
 *orosu-server** once on your target machine and let CI push deployment jobs to it through secure WebSocket connections.
 
+See [`CHANGELOG.md`](CHANGELOG.md) for release notes, including the 0.7.0 hardening release (16 fixes
+from a full-scale security/robustness review — no config, CLI, or protocol changes, safe to upgrade
+into).
+
 ---
 
 ## The Problem
