@@ -4,14 +4,13 @@ use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::ed25519::signature::rand_core::OsRng;
 
+// Deliberately no `Debug` derive — `key` is the raw Ed25519 signing seed.
+// Every other secret-holding type in this file (`ServerKeygen`,
+// `ServerStaticKey`) omits it the same way, so a future
+// `tracing::debug!("{:?}", key)` fails to compile instead of leaking a
+// private key into logs.
 #[derive(
-    Debug,
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct ClientKey {
     pub client_name: String,
