@@ -37,6 +37,18 @@ const LAUNCH_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// connection, its temp file, and its tokio task.
 const FILE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Caps how many entries a single attachment's zip archive may contain and
+/// how many bytes total may be decompressed from it, independent of what
+/// the archive's own (attacker-controlled) metadata declares. Without
+/// this, a small, highly-compressed "zip bomb" attachment — or one with an
+/// enormous number of tiny entries — can exhaust server disk or perform an
+/// unbounded number of file-creation syscalls during extraction. Sized
+/// generously for this tool's actual use case (predefined-script
+/// attachments: config files, small scripts, occasional build artifacts),
+/// not as a general-purpose archive size limit.
+const MAX_ZIP_ENTRIES: usize = 10_000;
+const MAX_EXTRACTED_BYTES: u64 = 128 * 1024 * 1024;
+
 /// The only place outgoing envelope bytes get sealed. Failure is only
 /// reachable if this connection's per-direction nonce counter has been
 /// exhausted (u64::MAX messages on one connection, not reachable in
@@ -69,6 +81,34 @@ async fn fail_launch<S>(
     let sealed = seal_or_log(security, error_message);
     _ = sender.send(Message::Binary(sealed.into())).await;
     _ = sender.send(Message::Close(None)).await;
+}
+
+/// Like `std::io::copy`, but errors out once `*total_extracted` (summed
+/// across every entry extracted from this attachment so far) would exceed
+/// `limit` — enforced against bytes actually read off the decompression
+/// stream, not a zip entry's own declared uncompressed size, since a
+/// zip-bomb entry's declared size is attacker-controlled and can't be
+/// trusted for enforcement.
+fn copy_bounded(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    total_extracted: &mut u64,
+    limit: u64,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        *total_extracted = total_extracted.saturating_add(n as u64);
+        if *total_extracted > limit {
+            return Err(std::io::Error::other(
+                "attachment exceeds the maximum allowed decompressed size",
+            ));
+        }
+        writer.write_all(&buf[..n])?;
+    }
 }
 
 impl TasksHandler {
@@ -347,6 +387,22 @@ async fn handle_task_run_output(
                     return;
                 }
             };
+
+            if archive.len() > MAX_ZIP_ENTRIES {
+                tracing::error!(
+                    "Attachment has too many zip entries ({} > {MAX_ZIP_ENTRIES})",
+                    archive.len()
+                );
+                fail_launch(
+                    &mut sender,
+                    &mut security,
+                    ServerErrorResponse::CannotLaunchScript,
+                )
+                .await;
+                return;
+            }
+
+            let mut total_extracted: u64 = 0;
             for i in 0..archive.len() {
                 let mut entry = match archive.by_index(i) {
                     Ok(entry) => entry,
@@ -424,7 +480,12 @@ async fn handle_task_run_output(
                             return;
                         }
                     };
-                    if let Err(e) = std::io::copy(&mut entry, &mut outfile) {
+                    if let Err(e) = copy_bounded(
+                        &mut entry,
+                        &mut outfile,
+                        &mut total_extracted,
+                        MAX_EXTRACTED_BYTES,
+                    ) {
                         tracing::error!(
                             "Failed to extract zip entry to {}: {e}",
                             output_path.display()
@@ -552,5 +613,53 @@ async fn handle_task_run_output(
         .is_err()
     {
         tracing::warn!("Client did not close connection in time");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_bounded_succeeds_when_total_is_exactly_at_the_limit() {
+        let data = vec![7u8; 10];
+        let mut reader = data.as_slice();
+        let mut writer = Vec::new();
+        let mut total = 0u64;
+
+        copy_bounded(&mut reader, &mut writer, &mut total, 10).unwrap();
+
+        assert_eq!(writer, data);
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn copy_bounded_errors_once_the_limit_is_exceeded() {
+        let data = vec![7u8; 11];
+        let mut reader = data.as_slice();
+        let mut writer = Vec::new();
+        let mut total = 0u64;
+
+        let result = copy_bounded(&mut reader, &mut writer, &mut total, 10);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn copy_bounded_accumulates_across_calls_sharing_the_same_total() {
+        let mut total = 0u64;
+        let mut writer = Vec::new();
+
+        let mut first = [1u8; 6].as_slice();
+        copy_bounded(&mut first, &mut writer, &mut total, 10).unwrap();
+        assert_eq!(total, 6);
+
+        // A second entry that individually fits under the limit still
+        // fails once combined with the first — this is what actually
+        // stops many-small-entries zip bombs, not just one huge entry.
+        let mut second = [2u8; 6].as_slice();
+        let result = copy_bounded(&mut second, &mut writer, &mut total, 10);
+
+        assert!(result.is_err());
     }
 }

@@ -757,6 +757,118 @@ async fn non_zip_attachment_bytes_are_rejected_as_a_clean_failure() {
     }
 }
 
+/// An archive with more entries than the server allows (MAX_ZIP_ENTRIES in
+/// lib/src/server/handler/tasks.rs, currently 10,000 — mirrored here as a
+/// literal since it's a private implementation constant) must be rejected
+/// as a clean failure before extraction even starts, rather than performing
+/// an unbounded number of file-creation syscalls.
+#[tokio::test]
+async fn too_many_zip_entries_is_rejected_as_a_clean_failure() {
+    let port = 19128;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(config_with_attachment_script(port, &public_key_path), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    const MAX_ZIP_ENTRIES: usize = 10_000;
+    let names: Vec<String> = (0..=MAX_ZIP_ENTRIES).map(|i| format!("f{i}")).collect();
+    let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b""[..])).collect();
+    let zip_bytes = build_zip(&entries);
+    let hash = md5::compute(&zip_bytes).0.to_vec();
+    let size = zip_bytes.len();
+
+    send_launch(
+        &mut ws,
+        "cat-file",
+        vec![],
+        Some(FileAttachment { hash, size }),
+    )
+    .await;
+
+    loop {
+        match recv_launch_response(&mut ws).await {
+            TaskLaunchStatusResponseEnvelope::Success {
+                body: TaskLaunchStatus::AwaitingFiles { offset },
+            } => {
+                let chunk = FileChunkRequestEnvelope {
+                    body: FileChunk {
+                        offset,
+                        data: zip_bytes.clone(),
+                    },
+                };
+                ws.send(Message::Binary(chunk.into())).await.unwrap();
+            }
+            TaskLaunchStatusResponseEnvelope::Failure { error } => {
+                assert!(matches!(
+                    error,
+                    orosu::api::ServerErrorResponse::CannotLaunchScript
+                ));
+                return;
+            }
+            other => panic!("expected AwaitingFiles or Failure, got {other:?}"),
+        }
+    }
+}
+
+/// A single entry whose *decompressed* size exceeds the server's cap
+/// (MAX_EXTRACTED_BYTES, currently 128 MiB — mirrored here as a literal)
+/// must be rejected as a clean failure rather than exhausting server disk.
+/// The entry content is all-zero, so it compresses to a tiny fraction of
+/// its declared size — this is the actual "zip bomb" shape the cap exists
+/// for, as opposed to a large but honestly-sized attachment.
+#[tokio::test]
+async fn a_zip_bomb_exceeding_the_decompressed_size_cap_is_rejected_as_a_clean_failure() {
+    let port = 19129;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(config_with_attachment_script(port, &public_key_path), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    const MAX_EXTRACTED_BYTES: usize = 128 * 1024 * 1024;
+    let bomb_content = vec![0u8; MAX_EXTRACTED_BYTES + 1024];
+    let zip_bytes = build_zip(&[("bomb.bin", &bomb_content)]);
+    let hash = md5::compute(&zip_bytes).0.to_vec();
+    let size = zip_bytes.len();
+
+    send_launch(
+        &mut ws,
+        "cat-file",
+        vec![],
+        Some(FileAttachment { hash, size }),
+    )
+    .await;
+
+    loop {
+        match recv_launch_response(&mut ws).await {
+            TaskLaunchStatusResponseEnvelope::Success {
+                body: TaskLaunchStatus::AwaitingFiles { offset },
+            } => {
+                let chunk = FileChunkRequestEnvelope {
+                    body: FileChunk {
+                        offset,
+                        data: zip_bytes.clone(),
+                    },
+                };
+                ws.send(Message::Binary(chunk.into())).await.unwrap();
+            }
+            TaskLaunchStatusResponseEnvelope::Failure { error } => {
+                assert!(matches!(
+                    error,
+                    orosu::api::ServerErrorResponse::CannotLaunchScript
+                ));
+                return;
+            }
+            other => panic!("expected AwaitingFiles or Failure, got {other:?}"),
+        }
+    }
+}
+
 /// Zip-slip: an attachment whose entry name attempts to escape the
 /// extraction directory (`../evil.txt`) must be rejected as a clean
 /// failure, not extracted outside the temp directory and not a panic/hang.
