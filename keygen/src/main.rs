@@ -15,14 +15,37 @@ fn prompt_input(prompt: &str) -> anyhow::Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// Whether a written file should be restricted to owner-only access. Public
+/// keys are meant to be shared, so they're written with the process's
+/// default (umask-controlled) permissions; private keys are secrets and
+/// must not depend on the umask being configured safely.
+enum WritePermissions {
+    Default,
+    OwnerOnly,
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 fn write_or_print(
     label: &str,
     value: String,
     output: Option<std::path::PathBuf>,
+    permissions: WritePermissions,
 ) -> anyhow::Result<()> {
     match output {
         Some(path) => {
             std::fs::write(&path, value)?;
+            #[cfg(unix)]
+            if matches!(permissions, WritePermissions::OwnerOnly) {
+                restrict_to_owner(&path)?;
+            }
+            #[cfg(not(unix))]
+            let _ = permissions;
             println!("{label} written to {}", path.display());
         }
         None => {
@@ -54,8 +77,66 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    write_or_print("Private key", private_key, arguments.private_key_output)?;
-    write_or_print("Public key", public_key, arguments.public_key_output)?;
+    write_or_print(
+        "Private key",
+        private_key,
+        arguments.private_key_output,
+        WritePermissions::OwnerOnly,
+    )?;
+    write_or_print(
+        "Public key",
+        public_key,
+        arguments.public_key_output,
+        WritePermissions::Default,
+    )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_output_is_written_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.key");
+
+        write_or_print(
+            "Private key",
+            "shh".to_string(),
+            Some(path.clone()),
+            WritePermissions::OwnerOnly,
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_output_does_not_restrict_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("public.key");
+        // Start from a mode `write_or_print` would never itself produce, so
+        // a passing test proves Default really is a no-op rather than
+        // coincidentally landing on the same bits some other way.
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_or_print(
+            "Public key",
+            "not-a-secret".to_string(),
+            Some(path.clone()),
+            WritePermissions::Default,
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666);
+    }
 }
