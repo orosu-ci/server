@@ -705,6 +705,58 @@ async fn file_hash_mismatch_is_reported_as_a_failure() {
     }
 }
 
+/// Bytes that aren't a zip archive at all (but do match their declared hash
+/// and size, so they pass the earlier integrity check) must be rejected as
+/// a clean failure by `ZipArchive::new`, not a panic that kills the
+/// connection's tokio task mid-stream.
+#[tokio::test]
+async fn non_zip_attachment_bytes_are_rejected_as_a_clean_failure() {
+    let port = 19127;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(config_with_attachment_script(port, &public_key_path), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    let garbage = b"this is not a zip file, just plain garbage bytes".to_vec();
+    let hash = md5::compute(&garbage).0.to_vec();
+    let size = garbage.len();
+
+    send_launch(
+        &mut ws,
+        "cat-file",
+        vec![],
+        Some(FileAttachment { hash, size }),
+    )
+    .await;
+
+    loop {
+        match recv_launch_response(&mut ws).await {
+            TaskLaunchStatusResponseEnvelope::Success {
+                body: TaskLaunchStatus::AwaitingFiles { offset },
+            } => {
+                let chunk = FileChunkRequestEnvelope {
+                    body: FileChunk {
+                        offset,
+                        data: garbage.clone(),
+                    },
+                };
+                ws.send(Message::Binary(chunk.into())).await.unwrap();
+            }
+            TaskLaunchStatusResponseEnvelope::Failure { error } => {
+                assert!(matches!(
+                    error,
+                    orosu::api::ServerErrorResponse::CannotLaunchScript
+                ));
+                return;
+            }
+            other => panic!("expected AwaitingFiles or Failure, got {other:?}"),
+        }
+    }
+}
+
 /// Zip-slip: an attachment whose entry name attempts to escape the
 /// extraction directory (`../evil.txt`) must be rejected as a clean
 /// failure, not extracted outside the temp directory and not a panic/hang.
