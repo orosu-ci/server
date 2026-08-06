@@ -10,6 +10,7 @@ use crate::server::handshake::establish_security;
 use crate::server::{AuthContext, ServerState};
 use crate::tasks::TaskLaunchResult;
 use crate::tasks::task::Task;
+use axum::Error as WsError;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -129,6 +130,29 @@ fn drain_buffered<T>(rx: &mut mpsc::Receiver<T>) -> Vec<T> {
     drained
 }
 
+/// Reads the next application message from `stream`, transparently
+/// skipping WS-level Ping/Pong frames. Axum already auto-replies to a Ping
+/// with a Pong, but still surfaces both to the application (see
+/// `Message`'s own doc comments) rather than filtering them out of the
+/// stream — without this, a spec-compliant peer's keepalive during the
+/// launch handshake or mid-upload would hit this module's
+/// `let Message::Binary(x) = msg else { ...close... }` checks and be
+/// torn down as "cannot deserialize" even though nothing is malformed.
+/// Callers wrap the *whole* call in one `timeout`, rather than resetting a
+/// timeout on every read, so a stream of keepalives can't be used to
+/// extend the wait indefinitely.
+async fn recv_skipping_keepalives<S>(stream: &mut S) -> Option<Result<Message, WsError>>
+where
+    S: futures_util::Stream<Item = Result<Message, WsError>> + Unpin,
+{
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+            other => return other,
+        }
+    }
+}
+
 impl TasksHandler {
     pub async fn attach(
         State(state): State<Arc<ServerState>>,
@@ -200,7 +224,12 @@ async fn handle_task_run_output(
         }
     };
 
-    let task_message_result = match timeout(LAUNCH_MESSAGE_TIMEOUT, socket.recv()).await {
+    let task_message_result = match timeout(
+        LAUNCH_MESSAGE_TIMEOUT,
+        recv_skipping_keepalives(&mut socket),
+    )
+    .await
+    {
         Ok(Some(result)) => result,
         Ok(None) => {
             tracing::info!("Client disconnected");
@@ -286,7 +315,12 @@ async fn handle_task_run_output(
                 };
                 let sealed = seal_or_log(&mut security, chunk_message);
                 _ = sender.send(Message::Binary(sealed.into())).await;
-                let response = match timeout(FILE_CHUNK_TIMEOUT, receiver.next()).await {
+                let response = match timeout(
+                    FILE_CHUNK_TIMEOUT,
+                    recv_skipping_keepalives(&mut receiver),
+                )
+                .await
+                {
                     Ok(Some(response)) => response,
                     Ok(None) => {
                         tracing::error!("Client disconnected during file transfer");
