@@ -55,8 +55,29 @@ fn write_or_print(
     Ok(())
 }
 
+/// Rejects `--private-key-output`/`--public-key-output` pointing at the
+/// same path. Without this, writing the private key first and the public
+/// key second (main's actual write order) would silently overwrite the
+/// private key file with the public key — the operator walks away
+/// believing they have a private key file when they don't, discovered only
+/// later when authentication fails.
+fn validate_output_paths(arguments: &CliArguments) -> anyhow::Result<()> {
+    if let (Some(private), Some(public)) =
+        (&arguments.private_key_output, &arguments.public_key_output)
+        && private == public
+    {
+        anyhow::bail!(
+            "--private-key-output and --public-key-output must not be the same path ({}); \
+             writing both would silently overwrite the private key with the public key",
+            private.display()
+        );
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let arguments = CliArguments::parse();
+    validate_output_paths(&arguments)?;
 
     let (private_key, public_key) = match arguments.kind {
         KeyKind::Client => {
@@ -138,5 +159,44 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o666);
+    }
+
+    fn args_with_outputs(private: &str, public: &str) -> CliArguments {
+        CliArguments::try_parse_from([
+            "orosu-keygen",
+            "--private-key-output",
+            private,
+            "--public-key-output",
+            public,
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_identical_private_and_public_output_paths() {
+        let args = args_with_outputs("same.key", "same.key");
+        assert!(validate_output_paths(&args).is_err());
+    }
+
+    #[test]
+    fn allows_distinct_output_paths() {
+        let args = args_with_outputs("priv.key", "pub.key");
+        assert!(validate_output_paths(&args).is_ok());
+    }
+
+    #[test]
+    fn allows_omitted_output_paths() {
+        let args = CliArguments::try_parse_from(["orosu-keygen"]).unwrap();
+        assert!(validate_output_paths(&args).is_ok());
+    }
+
+    // Only writing one of the two outputs is fine even if the other is
+    // omitted — there's no clobbering risk when only one file is written.
+    #[test]
+    fn allows_only_one_output_path_set() {
+        let args =
+            CliArguments::try_parse_from(["orosu-keygen", "--private-key-output", "only.key"])
+                .unwrap();
+        assert!(validate_output_paths(&args).is_ok());
     }
 }
