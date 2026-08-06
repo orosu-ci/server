@@ -25,6 +25,18 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::time::timeout;
 use zip::ZipArchive;
 
+/// Independent of `establish_security`'s own 10s handshake timeout — bounds
+/// how long a connection can sit idle after the handshake (if any)
+/// completes without ever sending the StartTaskRequest.
+const LAUNCH_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Matches the client's own per-frame read timeout (30s, see
+/// client/src/wsClient.js's FRAME_TIMEOUT_MS) — a well-behaved client sends
+/// each file chunk well within that window, so waiting the same amount of
+/// time here bounds how long a stalled or malicious upload can tie up this
+/// connection, its temp file, and its tokio task.
+const FILE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The only place outgoing envelope bytes get sealed. Failure is only
 /// reachable if this connection's per-direction nonce counter has been
 /// exhausted (u64::MAX messages on one connection, not reachable in
@@ -112,10 +124,18 @@ async fn handle_task_run_output(
         }
     };
 
-    let Some(task_message_result) = socket.recv().await else {
-        tracing::info!("Client disconnected");
-        _ = socket.send(Message::Close(None)).await;
-        return;
+    let task_message_result = match timeout(LAUNCH_MESSAGE_TIMEOUT, socket.recv()).await {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            tracing::info!("Client disconnected");
+            _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("Client did not send a launch message in time");
+            _ = socket.send(Message::Close(None)).await;
+            return;
+        }
     };
     let Ok(task_message) = task_message_result else {
         tracing::error!("Cannot receive task message");
@@ -178,10 +198,18 @@ async fn handle_task_run_output(
                 };
                 let sealed = seal_or_log(&mut security, chunk_message);
                 _ = sender.send(Message::Binary(sealed.into())).await;
-                let Some(response) = receiver.next().await else {
-                    tracing::error!("Client disconnected during file transfer");
-                    _ = sender.send(Message::Close(None)).await;
-                    return;
+                let response = match timeout(FILE_CHUNK_TIMEOUT, receiver.next()).await {
+                    Ok(Some(response)) => response,
+                    Ok(None) => {
+                        tracing::error!("Client disconnected during file transfer");
+                        _ = sender.send(Message::Close(None)).await;
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("Client did not send the next file chunk in time");
+                        _ = sender.send(Message::Close(None)).await;
+                        return;
+                    }
                 };
                 let Ok(response) = response else {
                     tracing::error!("Cannot deserialize file chunk message");
