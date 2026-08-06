@@ -1392,3 +1392,71 @@ clients: []
     // so a wedged bind would surface as this call timing out and panicking.
     spawn_server_unix(config).await;
 }
+
+// Both tests below pause the tokio clock *after* the real setup I/O
+// (connecting, authenticating) has already completed, then never send the
+// message the server is waiting on. On this single-threaded runtime — the
+// server's spawned task and the test body share it — once both the server
+// (blocked inside `timeout(...)`) and this task (blocked on `ws.next()`,
+// real socket I/O) are parked with nothing left to do, tokio auto-advances
+// the paused clock straight to the server's timeout deadline instead of
+// really sleeping, so these assert a real 10s/30s server-side timeout fires
+// without costing 10s/30s of wall-clock test time.
+
+#[tokio::test]
+async fn a_client_that_never_sends_a_launch_message_is_disconnected_after_the_timeout() {
+    let port = 19125;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(single_client_config(port, &public_key_path, ""), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    tokio::time::pause();
+
+    // Deliberately never sends a StartTaskRequest.
+    match ws.next().await {
+        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+        Some(Ok(other)) => panic!("expected disconnection, got a message: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_stalls_mid_upload_is_disconnected_after_the_timeout() {
+    let port = 19126;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(config_with_attachment_script(port, &public_key_path), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    let zip_bytes = build_zip(&[("test.txt", b"hello attachment")]);
+    let hash = md5::compute(&zip_bytes).0.to_vec();
+    let size = zip_bytes.len();
+
+    send_launch(
+        &mut ws,
+        "cat-file",
+        vec![],
+        Some(FileAttachment { hash, size }),
+    )
+    .await;
+    match recv_launch_response(&mut ws).await {
+        TaskLaunchStatusResponseEnvelope::Success {
+            body: TaskLaunchStatus::AwaitingFiles { .. },
+        } => {}
+        other => panic!("expected AwaitingFiles, got {other:?}"),
+    }
+
+    tokio::time::pause();
+
+    // Deliberately never sends the requested file chunk.
+    match ws.next().await {
+        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+        Some(Ok(other)) => panic!("expected disconnection, got a message: {other:?}"),
+    }
+}
