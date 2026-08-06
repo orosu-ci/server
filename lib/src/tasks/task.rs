@@ -76,7 +76,12 @@ impl Task {
             command.env("ATTACHMENTS_DIR", path);
         }
 
-        #[cfg(target_os = "linux")]
+        // uid()/gid() (tokio::process::Command) and the `users` crate both
+        // work identically on any unix, not just Linux — gating on
+        // target_os = "linux" silently compiled the run_as privilege drop
+        // out entirely on macOS/BSD, running the script as the server's own
+        // user instead of the configured one with no warning.
+        #[cfg(unix)]
         {
             if let Some(username) = script.run_as {
                 let user = users::get_user_by_name(&username).ok_or_else(|| {
