@@ -43,7 +43,6 @@ fn seal_or_log(security: &mut ConnectionSecurity, envelope: impl Into<bytes::Byt
 
 impl TasksHandler {
     pub async fn attach(
-        ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
         State(state): State<Arc<ServerState>>,
         auth_context: AuthContext,
         ws: WebSocketUpgrade,
@@ -58,23 +57,34 @@ impl TasksHandler {
 
         let (mut parts, _) = request.into_parts();
 
-        let ip = ClientIp::from_request_parts(&mut parts, &())
-            .await
-            .map(|e| e.0)
-            .unwrap_or_else(|_| remote_addr.ip());
-
-        if let Some(whitelist) = &client.whitelisted_ips
-            && !whitelist.iter().any(|cidr| cidr.contains(&ip))
-        {
-            tracing::warn!("Client {} is not whitelisted for {}", ip, client.name);
-            return StatusCode::FORBIDDEN.into_response();
+        // Unix domain socket peers have no IP address at all —
+        // `ConnectInfo<SocketAddr>` is only ever inserted for TCP
+        // connections (see `Server::serve`). When neither it nor a
+        // forwarded-for header is present, there's no IP to filter on, so
+        // per-client allow/deny lists are skipped rather than treated as a
+        // hard extraction failure.
+        let ip = match ClientIp::from_request_parts(&mut parts, &()).await {
+            Ok(ip) => Some(ip.0),
+            Err(_) => parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| addr.ip()),
         };
 
-        if let Some(blacklist) = &client.blacklisted_ips
-            && blacklist.iter().any(|cidr| cidr.contains(&ip))
-        {
-            tracing::warn!("Client {} is blacklisted for {}", ip, client.name);
-            return StatusCode::FORBIDDEN.into_response();
+        if let Some(ip) = ip {
+            if let Some(whitelist) = &client.whitelisted_ips
+                && !whitelist.iter().any(|cidr| cidr.contains(&ip))
+            {
+                tracing::warn!("Client {} is not whitelisted for {}", ip, client.name);
+                return StatusCode::FORBIDDEN.into_response();
+            };
+
+            if let Some(blacklist) = &client.blacklisted_ips
+                && blacklist.iter().any(|cidr| cidr.contains(&ip))
+            {
+                tracing::warn!("Client {} is blacklisted for {}", ip, client.name);
+                return StatusCode::FORBIDDEN.into_response();
+            }
         }
 
         ws.on_upgrade(move |socket| handle_task_run_output(socket, client, protocol_version, state))
