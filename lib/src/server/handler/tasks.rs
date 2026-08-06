@@ -53,6 +53,24 @@ fn seal_or_log(security: &mut ConnectionSecurity, envelope: impl Into<bytes::Byt
     }
 }
 
+/// Sends a `Failure` envelope followed by a close frame — the same
+/// clean-rejection sequence every malformed-input path in this module uses,
+/// factored out because the attachment-processing path below has several
+/// independent fallible steps (zip parsing, entry extraction, disk I/O)
+/// that all need to fail the same way instead of panicking.
+async fn fail_launch<S>(
+    sender: &mut S,
+    security: &mut ConnectionSecurity,
+    error: ServerErrorResponse,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let error_message = TaskLaunchStatusResponseEnvelope::Failure { error };
+    let sealed = seal_or_log(security, error_message);
+    _ = sender.send(Message::Binary(sealed.into())).await;
+    _ = sender.send(Message::Close(None)).await;
+}
+
 impl TasksHandler {
     pub async fn attach(
         State(state): State<Arc<ServerState>>,
@@ -175,19 +193,31 @@ async fn handle_task_run_output(
 
     let Some(script) = script else {
         tracing::error!("Script {} not found", script_name);
-        let error_message = TaskLaunchStatusResponseEnvelope::Failure {
-            error: ServerErrorResponse::ScriptNotFound,
-        };
-        let sealed = seal_or_log(&mut security, error_message);
-        _ = sender.send(Message::Binary(sealed.into())).await;
-        _ = sender.send(Message::Close(None)).await;
+        fail_launch(
+            &mut sender,
+            &mut security,
+            ServerErrorResponse::ScriptNotFound,
+        )
+        .await;
         return;
     };
 
     let attachment = match attachment {
         None => None,
         Some(attachment) => {
-            let mut output = NamedTempFile::with_suffix(".zip").unwrap();
+            let mut output = match NamedTempFile::with_suffix(".zip") {
+                Ok(output) => output,
+                Err(e) => {
+                    tracing::error!("Failed to create a temp file for the attachment: {e}");
+                    fail_launch(
+                        &mut sender,
+                        &mut security,
+                        ServerErrorResponse::CannotLaunchScript,
+                    )
+                    .await;
+                    return;
+                }
+            };
             let mut offset = 0;
             let size = attachment.size;
             let hash = attachment.hash;
@@ -237,12 +267,30 @@ async fn handle_task_run_output(
                     tracing::error!("Unexpected chunk offset {chunk_offset}, expected {offset}");
                     return;
                 }
-                output.write_all(&body.data).unwrap();
+                if let Err(e) = output.write_all(&body.data) {
+                    tracing::error!("Failed to write attachment chunk to disk: {e}");
+                    fail_launch(
+                        &mut sender,
+                        &mut security,
+                        ServerErrorResponse::CannotLaunchScript,
+                    )
+                    .await;
+                    return;
+                }
                 hasher.consume(&body.data);
                 offset += body.data.len();
                 tracing::debug!("Received attachment chunk with offset {chunk_offset}");
             }
-            output.seek(SeekFrom::Start(0)).unwrap();
+            if let Err(e) = output.seek(SeekFrom::Start(0)) {
+                tracing::error!("Failed to seek the attachment file: {e}");
+                fail_launch(
+                    &mut sender,
+                    &mut security,
+                    ServerErrorResponse::CannotLaunchScript,
+                )
+                .await;
+                return;
+            }
             tracing::debug!(
                 "Finished attached file, saved into {}",
                 output.path().display()
@@ -251,12 +299,12 @@ async fn handle_task_run_output(
             let computed_hash = hasher.finalize().0.to_vec();
             if computed_hash != hash {
                 tracing::error!("File hash mismatch");
-                let error_message = TaskLaunchStatusResponseEnvelope::Failure {
-                    error: ServerErrorResponse::CannotLaunchScript,
-                };
-                let sealed = seal_or_log(&mut security, error_message);
-                _ = sender.send(Message::Binary(sealed.into())).await;
-                _ = sender.send(Message::Close(None)).await;
+                fail_launch(
+                    &mut sender,
+                    &mut security,
+                    ServerErrorResponse::CannotLaunchScript,
+                )
+                .await;
                 return;
             }
             tracing::debug!("File hash validated successfully");
@@ -268,15 +316,51 @@ async fn handle_task_run_output(
     let directory = match attachment {
         None => None,
         Some(mut file) => {
-            let directory = TempDir::new().unwrap();
+            let directory = match TempDir::new() {
+                Ok(directory) => directory,
+                Err(e) => {
+                    tracing::error!("Failed to create a temp directory for extraction: {e}");
+                    fail_launch(
+                        &mut sender,
+                        &mut security,
+                        ServerErrorResponse::CannotLaunchScript,
+                    )
+                    .await;
+                    return;
+                }
+            };
             tracing::debug!(
                 "Created temporary directory for attached files: {}",
                 directory.path().display()
             );
 
-            let mut archive = ZipArchive::new(&mut file).unwrap();
+            let mut archive = match ZipArchive::new(&mut file) {
+                Ok(archive) => archive,
+                Err(e) => {
+                    tracing::error!("Failed to read attachment as a zip archive: {e}");
+                    fail_launch(
+                        &mut sender,
+                        &mut security,
+                        ServerErrorResponse::CannotLaunchScript,
+                    )
+                    .await;
+                    return;
+                }
+            };
             for i in 0..archive.len() {
-                let mut entry = archive.by_index(i).unwrap();
+                let mut entry = match archive.by_index(i) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        tracing::error!("Failed to read zip entry {i}: {e}");
+                        fail_launch(
+                            &mut sender,
+                            &mut security,
+                            ServerErrorResponse::CannotLaunchScript,
+                        )
+                        .await;
+                        return;
+                    }
+                };
 
                 // entry.name() is the raw, attacker-controlled name from the
                 // zip's central directory — joining it onto directory.path()
@@ -290,24 +374,69 @@ async fn handle_task_run_output(
                         "Attachment contains an unsafe zip entry name: {:?}",
                         entry.name()
                     );
-                    let error_message = TaskLaunchStatusResponseEnvelope::Failure {
-                        error: ServerErrorResponse::CannotLaunchScript,
-                    };
-                    let sealed = seal_or_log(&mut security, error_message);
-                    _ = sender.send(Message::Binary(sealed.into())).await;
-                    _ = sender.send(Message::Close(None)).await;
+                    fail_launch(
+                        &mut sender,
+                        &mut security,
+                        ServerErrorResponse::CannotLaunchScript,
+                    )
+                    .await;
                     return;
                 };
                 let output_path = directory.path().join(relative_path);
 
                 if entry.is_dir() {
-                    std::fs::create_dir_all(&output_path).unwrap();
-                } else {
-                    if let Some(parent) = output_path.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
+                    if let Err(e) = std::fs::create_dir_all(&output_path) {
+                        tracing::error!(
+                            "Failed to create directory {}: {e}",
+                            output_path.display()
+                        );
+                        fail_launch(
+                            &mut sender,
+                            &mut security,
+                            ServerErrorResponse::CannotLaunchScript,
+                        )
+                        .await;
+                        return;
                     }
-                    let mut outfile = File::create(&output_path).unwrap();
-                    std::io::copy(&mut entry, &mut outfile).unwrap();
+                } else {
+                    if let Some(parent) = output_path.parent()
+                        && let Err(e) = std::fs::create_dir_all(parent)
+                    {
+                        tracing::error!("Failed to create directory {}: {e}", parent.display());
+                        fail_launch(
+                            &mut sender,
+                            &mut security,
+                            ServerErrorResponse::CannotLaunchScript,
+                        )
+                        .await;
+                        return;
+                    }
+                    let mut outfile = match File::create(&output_path) {
+                        Ok(outfile) => outfile,
+                        Err(e) => {
+                            tracing::error!("Failed to create file {}: {e}", output_path.display());
+                            fail_launch(
+                                &mut sender,
+                                &mut security,
+                                ServerErrorResponse::CannotLaunchScript,
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    if let Err(e) = std::io::copy(&mut entry, &mut outfile) {
+                        tracing::error!(
+                            "Failed to extract zip entry to {}: {e}",
+                            output_path.display()
+                        );
+                        fail_launch(
+                            &mut sender,
+                            &mut security,
+                            ServerErrorResponse::CannotLaunchScript,
+                        )
+                        .await;
+                        return;
+                    }
                 }
                 tracing::debug!("Extracted: {}", output_path.display());
             }
@@ -329,12 +458,12 @@ async fn handle_task_run_output(
         Ok(task) => task,
         Err(e) => {
             tracing::error!("Unable to launch script {}: {:?}", script_name, e);
-            let error_message = TaskLaunchStatusResponseEnvelope::Failure {
-                error: ServerErrorResponse::CannotLaunchScript,
-            };
-            let sealed = seal_or_log(&mut security, error_message);
-            _ = sender.send(Message::Binary(sealed.into())).await;
-            _ = sender.send(Message::Close(None)).await;
+            fail_launch(
+                &mut sender,
+                &mut security,
+                ServerErrorResponse::CannotLaunchScript,
+            )
+            .await;
             return;
         }
     };
