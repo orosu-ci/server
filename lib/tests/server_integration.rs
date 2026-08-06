@@ -629,6 +629,108 @@ async fn file_hash_mismatch_is_reported_as_a_failure() {
     }
 }
 
+/// Zip-slip: an attachment whose entry name attempts to escape the
+/// extraction directory (`../evil.txt`) must be rejected as a clean
+/// failure, not extracted outside the temp directory and not a panic/hang.
+#[tokio::test]
+async fn zip_slip_attempt_is_rejected_as_a_clean_failure() {
+    let port = 19123;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(config_with_attachment_script(port, &public_key_path), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    let zip_bytes = build_zip(&[("../evil.txt", b"pwned")]);
+    let hash = md5::compute(&zip_bytes).0.to_vec();
+    let size = zip_bytes.len();
+
+    send_launch(
+        &mut ws,
+        "cat-file",
+        vec![],
+        Some(FileAttachment { hash, size }),
+    )
+    .await;
+
+    loop {
+        match recv_launch_response(&mut ws).await {
+            TaskLaunchStatusResponseEnvelope::Success {
+                body: TaskLaunchStatus::AwaitingFiles { offset },
+            } => {
+                let chunk = FileChunkRequestEnvelope {
+                    body: FileChunk {
+                        offset,
+                        data: zip_bytes.clone(),
+                    },
+                };
+                ws.send(Message::Binary(chunk.into())).await.unwrap();
+            }
+            TaskLaunchStatusResponseEnvelope::Failure { error } => {
+                assert!(matches!(
+                    error,
+                    orosu::api::ServerErrorResponse::CannotLaunchScript
+                ));
+                return;
+            }
+            other => panic!("expected AwaitingFiles or Failure, got {other:?}"),
+        }
+    }
+}
+
+/// Zip-slip via an absolute entry path, not just relative `../` traversal —
+/// `enclosed_name()` rejects both, but they're distinct code paths worth
+/// covering independently (a fix that only handled `../` would miss this).
+#[tokio::test]
+async fn zip_entry_with_an_absolute_path_is_rejected_as_a_clean_failure() {
+    let port = 19124;
+    let key_dir = tempfile::tempdir().unwrap();
+    let keygen = Keygen::new("test-client".to_string());
+    let public_key_path = write_public_key(key_dir.path(), &keygen);
+    spawn_server(config_with_attachment_script(port, &public_key_path), port).await;
+
+    let client_key = ClientKey::from_string(keygen.private_key_base64()).unwrap();
+    let mut ws = connect_authenticated(port, "test-client", &client_key.key).await;
+
+    let zip_bytes = build_zip(&[("/etc/evil.txt", b"pwned")]);
+    let hash = md5::compute(&zip_bytes).0.to_vec();
+    let size = zip_bytes.len();
+
+    send_launch(
+        &mut ws,
+        "cat-file",
+        vec![],
+        Some(FileAttachment { hash, size }),
+    )
+    .await;
+
+    loop {
+        match recv_launch_response(&mut ws).await {
+            TaskLaunchStatusResponseEnvelope::Success {
+                body: TaskLaunchStatus::AwaitingFiles { offset },
+            } => {
+                let chunk = FileChunkRequestEnvelope {
+                    body: FileChunk {
+                        offset,
+                        data: zip_bytes.clone(),
+                    },
+                };
+                ws.send(Message::Binary(chunk.into())).await.unwrap();
+            }
+            TaskLaunchStatusResponseEnvelope::Failure { error } => {
+                assert!(matches!(
+                    error,
+                    orosu::api::ServerErrorResponse::CannotLaunchScript
+                ));
+                return;
+            }
+            other => panic!("expected AwaitingFiles or Failure, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_file_chunk_at_the_wrong_offset_disconnects_rather_than_hanging() {
     let port = 19110;

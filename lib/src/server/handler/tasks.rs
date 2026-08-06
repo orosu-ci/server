@@ -239,7 +239,28 @@ async fn handle_task_run_output(
             let mut archive = ZipArchive::new(&mut file).unwrap();
             for i in 0..archive.len() {
                 let mut entry = archive.by_index(i).unwrap();
-                let output_path = directory.path().join(entry.name());
+
+                // entry.name() is the raw, attacker-controlled name from the
+                // zip's central directory — joining it onto directory.path()
+                // directly would let a `../` or absolute entry escape the
+                // extraction directory entirely (zip-slip). enclosed_name()
+                // validates the name can't contain NULL bytes, can't be
+                // absolute, and can't resolve outside the archive root
+                // before it's ever joined onto a real path.
+                let Some(relative_path) = entry.enclosed_name() else {
+                    tracing::error!(
+                        "Attachment contains an unsafe zip entry name: {:?}",
+                        entry.name()
+                    );
+                    let error_message = TaskLaunchStatusResponseEnvelope::Failure {
+                        error: ServerErrorResponse::CannotLaunchScript,
+                    };
+                    let sealed = seal_or_log(&mut security, error_message);
+                    _ = sender.send(Message::Binary(sealed.into())).await;
+                    _ = sender.send(Message::Close(None)).await;
+                    return;
+                };
+                let output_path = directory.path().join(relative_path);
 
                 if entry.is_dir() {
                     std::fs::create_dir_all(&output_path).unwrap();
